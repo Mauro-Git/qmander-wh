@@ -7,6 +7,8 @@ vulnerables (`protobufjs`, `axios`, `uuid`). En su lugar usa un cliente
 ligero que se conecta por **WebSocket al puerto 5036** con mensajes
 **JSON** en vez de Protobuf. Dependencias: solo `ws`, `express` y `zod`.
 
+**Package manager: pnpm** (no npm ni yarn).
+
 ## 1. Prerrequisitos en cTrader
 
 1. Crea tu cuenta **demo** de Pepperstone cTrader desde el área de cliente
@@ -27,12 +29,12 @@ ligero que se conecta por **WebSocket al puerto 5036** con mensajes
 
 ```bash
 cd tradingview-ctrader
-npm install
+pnpm install
 
 # Paso 1: obtener URL de autorización
 CTRADER_CLIENT_ID=tu_client_id \
 CTRADER_REDIRECT_URI=https://tu-dominio.com/callback \
-npm run get-token
+pnpm get-token
 # → Abre la URL en el navegador, autoriza, copia el ?code=... de la URL
 
 # Paso 2: intercambiar el code por tokens
@@ -40,20 +42,41 @@ CTRADER_CLIENT_ID=tu_client_id \
 CTRADER_CLIENT_SECRET=tu_client_secret \
 CTRADER_REDIRECT_URI=https://tu-dominio.com/callback \
 CODE=el_code_copiado \
-npm run get-token
+pnpm get-token
 # → Anota accessToken y refreshToken
 
 # Renovar token expirado (~30 días):
 CTRADER_CLIENT_ID=tu_client_id \
 CTRADER_CLIENT_SECRET=tu_client_secret \
 REFRESH_TOKEN=tu_refresh_token \
-npm run get-token
+pnpm get-token
+```
+
+**En Windows (PowerShell)**, las variables se definen así:
+```powershell
+$env:CTRADER_CLIENT_ID="tu_client_id"
+$env:CTRADER_REDIRECT_URI="https://tu-dominio.com/callback"
+pnpm get-token
 ```
 
 El `CTRADER_ACCOUNT_ID` es el **ctidTraderAccountId** de tu cuenta demo
 (visible en el Playground del portal Open API).
 
-## 3. Despliegue en EasyPanel (VPS Hostinger KVM2, Ubuntu 24.04)
+## 3. Desarrollo local
+
+```bash
+# Cargar variables de entorno (PowerShell)
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^([^#][^=]+)=(.*)$') {
+    [Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), "Process")
+  }
+}
+
+# Arrancar en modo desarrollo (con hot reload)
+pnpm dev
+```
+
+## 4. Despliegue en EasyPanel (VPS Hostinger KVM2, Ubuntu 24.04)
 
 1. Sube el proyecto a un repo Git privado (GitHub/GitLab).
 2. En EasyPanel: **Create Project → App**.
@@ -70,7 +93,7 @@ El `CTRADER_ACCOUNT_ID` es el **ctidTraderAccountId** de tu cuenta demo
    # → {"connected":true,"symbols":NNN,...}
    ```
 
-## 4. Alerta en TradingView
+## 5. Alerta en TradingView
 
 Webhook URL: `https://hooks.tudominio.com/webhook/tradingview`
 
@@ -93,7 +116,7 @@ Para venta: `"action": "sell"`. Para cerrar posiciones del símbolo:
 
 Trigger: **Once Per Bar Close**.
 
-## 5. Kill switch
+## 6. Kill switch
 
 ```bash
 # Activar (detiene ejecución sin tumbar el servicio)
@@ -109,7 +132,7 @@ curl -X POST https://hooks.tudominio.com/admin/kill-switch \
   -d '{"enabled": false}'
 ```
 
-## 6. Puntos a verificar en la primera prueba
+## 7. Puntos a verificar en la primera prueba
 
 - **Puerto 5036**: este cliente usa JSON sobre WebSocket (puerto 5036),
   no Protobuf (puerto 5035). Asegúrate de que tu VPS puede hacer
@@ -119,7 +142,7 @@ curl -X POST https://hooks.tudominio.com/admin/kill-switch \
 - **relativeStopLoss**: confirma que el SL quede a los pips esperados.
   Si no, ajusta `pipFactor` en `src/ctrader.ts`.
 - **Token**: el access token expira (~30 días). Renueva con el refresh
-  token usando `npm run get-token` con REFRESH_TOKEN=... y actualiza la
+  token usando `pnpm get-token` con REFRESH_TOKEN=... y actualiza la
   variable en EasyPanel.
 - **IPs de TradingView**: confirma la lista vigente en la documentación
   oficial (About webhooks) y actualízala en `server.ts`.
@@ -127,7 +150,7 @@ curl -X POST https://hooks.tudominio.com/admin/kill-switch \
   EasyPanel reinicia el contenedor automáticamente si el proceso muere
   (el código hace `process.exit(1)` ante fallo de conexión).
 
-## 7. Migración futura a FTMO
+## 8. Migración futura a FTMO
 
 Para operar en FTMO con cTrader, solo necesitas:
 1. Cambiar `CTRADER_HOST` a `demo.ctraderapi.com` o `live.ctraderapi.com`
@@ -137,10 +160,35 @@ Para operar en FTMO con cTrader, solo necesitas:
 4. Bajar `MAX_DAILY_REQUESTS` a 1500 o menos (FTMO prohíbe >2000/día).
 5. Implementar validaciones adicionales de drawdown diario/total.
 
-## 8. Secuencia de pruebas recomendada
+## 9. Secuencia de pruebas recomendada
 
 1. `curl` manual al webhook (comentar filtro IP temporalmente o agregar
    tu IP para pruebas).
 2. Alerta real de TradingView → verificar orden en cTrader **demo**.
 3. Semanas en demo midiendo: fills, slippage, símbolos, SL/TP correctos.
 4. Solo entonces, evaluar cuenta real.
+
+
+##  10. Comandos utiles powershell
+
+# Health del Webhook 
+  Invoke-RestMethod https://wh.qmander.com/health
+  
+# Generar Webhook secret
+  -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Max 256) }) 
+
+# URL Webhook
+  https://wh.qmander.com/webhook/tradingview
+
+# Obtener TimeStamp
+  [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
+# Cargar variables e inicial local
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^([^#][^=]+)=(.*)$') {
+    [Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), "Process")
+  }
+}
+pnpm dev (desarrollo)
+pnpm start (producción)
+
