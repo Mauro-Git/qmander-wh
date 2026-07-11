@@ -5,8 +5,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile --prod || pnpm install --prod
-RUN pnpm add tsx
+RUN pnpm install --frozen-lockfile || pnpm install
 
 COPY src ./src
 COPY scripts ./scripts
