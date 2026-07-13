@@ -1,6 +1,8 @@
 /**
  * Receptor de webhooks TradingView → cTrader Open API
  * ────────────────────────────────────────────────────
+ * Motor de señales: Scalper (papá) + Smart Trail (hijos) + Exit
+ *
  * Capas de seguridad:
  *   1. Filtro de IP de origen (TradingView)
  *   2. Token secreto con comparación timing-safe
@@ -8,13 +10,13 @@
  *   4. Anti-duplicados (idempotencia)
  *   5. Límites de riesgo + kill switch
  *
- * Luego: respuesta 200 inmediata → cola asíncrona → cTrader.
+ * Luego: respuesta 200 inmediata → cola asíncrona → motor de reglas → cTrader.
  */
 
 import express, { type Request, type Response } from 'express'
 import { timingSafeEqual, createHash } from 'node:crypto'
 import { z } from 'zod'
-import { initCTrader, marketOrder, closeAll, ctraderStatus } from './ctrader.js'
+import { initCTrader, marketOrder, closeAll, closeByLabel, getPositionsByLabel, ctraderStatus } from './ctrader.js'
 
 // ── Configuración ────────────────────────────────────────────
 
@@ -25,19 +27,28 @@ if (WEBHOOK_SECRET.length < 32) {
 }
 
 const PORT        = Number(process.env.PORT ?? 3000)
-const MAX_LOTS    = Number(process.env.MAX_LOTS ?? 0.01)
-const DEFAULT_SL  = Number(process.env.DEFAULT_SL_PIPS ?? 0) // 0 = exigir en payload
+const MAX_LOTS    = Number(process.env.MAX_LOTS ?? 5)
+const DEFAULT_SL  = Number(process.env.DEFAULT_SL_PIPS ?? 0)
 const ALLOWED_SYMBOLS = new Set(
   (process.env.ALLOWED_SYMBOLS ?? '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 )
 
-// IPs oficiales de TradingView (verificar lista vigente antes de producción)
 const TRADINGVIEW_IPS = new Set([
-  '52.89.214.238', '34.212.75.30', '54.218.53.128', '52.32.178.7', '127.0.0.1', '::1', '::ffff:127.0.0.1', '200.68.172.138', 
+  '52.89.214.238', '34.212.75.30', '54.218.53.128', '52.32.178.7',
 ])
 
 const MAX_AGE_MS = 60_000
 let killSwitch = false
+
+// ── Estado del motor de señales (por ticker) ─────────────────
+
+interface ScalperState {
+  direction: 'buy' | 'sell'
+  smartTrailCount: number  // contador para labels únicos
+}
+
+// Mapa: ticker → estado del scalper activo
+const scalperState = new Map<string, ScalperState>()
 
 // ── Esquema del payload ──────────────────────────────────────
 
@@ -45,6 +56,7 @@ const AlertSchema = z.object({
   secret:   z.string().min(32),
   alert_id: z.string().min(8).max(200),
   action:   z.enum(['buy', 'sell', 'close']),
+  signal:   z.enum(['scalper', 'smart_trail', 'exit']),
   ticker:   z.string().min(1).max(30),
   price:    z.number().positive(),
   time:     z.number().int().positive(),
@@ -71,6 +83,94 @@ function isDuplicate(id: string): boolean {
   return false
 }
 
+// ── Motor de reglas Scalper / Smart Trail / Exit ─────────────
+
+async function processSignal(alert: Alert): Promise<void> {
+  const ticker = alert.ticker
+  const state = scalperState.get(ticker.toUpperCase())
+
+  switch (alert.signal) {
+    // ─── SCALPER ───────────────────────────────────────────
+    case 'scalper': {
+      const side = alert.action as 'buy' | 'sell'
+      const lots = alert.lots ?? 5
+
+      if (!state) {
+        // No hay Scalper abierto → abrir nuevo
+        await marketOrder({
+          ticker, side, lots,
+          slPips: alert.sl_pips ?? DEFAULT_SL,
+          tpPips: alert.tp_pips,
+          label: `scalper-${side}`,
+        })
+        scalperState.set(ticker.toUpperCase(), { direction: side, smartTrailCount: 0 })
+        log('info', `[scalper] NUEVO ${side} ${lots} lotes ${ticker} (${alert.alert_id})`)
+
+      } else if (state.direction === side) {
+        // Misma dirección → ignorar
+        log('info', `[scalper] IGNORADO: ya hay scalper ${side} en ${ticker} (${alert.alert_id})`)
+
+      } else {
+        // Dirección contraria → cerrar todo y abrir nuevo
+        const closedScalper = await closeByLabel(ticker, 'scalper-')
+        const closedSmart = await closeByLabel(ticker, 'smarttrail-')
+        log('info', `[scalper] REVERSA: cerradas ${closedScalper} scalper + ${closedSmart} smart trail en ${ticker}`)
+
+        await marketOrder({
+          ticker, side, lots,
+          slPips: alert.sl_pips ?? DEFAULT_SL,
+          tpPips: alert.tp_pips,
+          label: `scalper-${side}`,
+        })
+        scalperState.set(ticker.toUpperCase(), { direction: side, smartTrailCount: 0 })
+        log('info', `[scalper] NUEVO ${side} ${lots} lotes ${ticker} (${alert.alert_id})`)
+      }
+      break
+    }
+
+    // ─── SMART TRAIL ──────────────────────────────────────
+    case 'smart_trail': {
+      const side = alert.action as 'buy' | 'sell'
+      const lots = alert.lots ?? 3
+
+      if (!state) {
+        log('info', `[smart_trail] IGNORADO: no hay scalper activo en ${ticker} (${alert.alert_id})`)
+        break
+      }
+
+      if (side !== state.direction) {
+        log('info', `[smart_trail] IGNORADO: ${side} contra scalper ${state.direction} en ${ticker} (${alert.alert_id})`)
+        break
+      }
+
+      // Misma dirección que el scalper → abrir posición
+      state.smartTrailCount += 1
+      const label = `smarttrail-${side}-${state.smartTrailCount}`
+
+      await marketOrder({
+        ticker, side, lots,
+        slPips: alert.sl_pips ?? DEFAULT_SL,
+        tpPips: alert.tp_pips,
+        label,
+      })
+      log('info', `[smart_trail] ${side} ${lots} lotes ${ticker} label=${label} (${alert.alert_id})`)
+      break
+    }
+
+    // ─── EXIT ─────────────────────────────────────────────
+    case 'exit': {
+      const closedSmart = await closeByLabel(ticker, 'smarttrail-')
+      if (closedSmart > 0) {
+        log('info', `[exit] ${closedSmart} smart trail cerradas en ${ticker} (${alert.alert_id})`)
+      } else {
+        log('info', `[exit] No hay smart trail abiertos en ${ticker} (${alert.alert_id})`)
+      }
+      // El scalper NO se toca
+      break
+    }
+  }
+}
+
 // ── Cola asíncrona con reintentos ────────────────────────────
 
 type Job = { alert: Alert; attempts: number }
@@ -82,31 +182,16 @@ async function processQueue(): Promise<void> {
   processing = true
   while (queue.length > 0) {
     const job = queue.shift() as Job
-    const a = job.alert
     try {
-      if (a.action === 'close') {
-        const n = await closeAll(a.ticker)
-        log('info', `close ${a.ticker}: ${n} posiciones cerradas (${a.alert_id})`)
-      } else {
-        await marketOrder({
-          ticker:  a.ticker,
-          side:    a.action,
-          lots:    a.lots ?? MAX_LOTS,
-          slPips:  a.sl_pips ?? DEFAULT_SL,
-          tpPips:  a.tp_pips,
-          label:   a.alert_id.slice(0, 90),
-        })
-        log('info', `${a.action} ${a.lots ?? MAX_LOTS} lotes ${a.ticker} OK (${a.alert_id})`)
-      }
+      await processSignal(job.alert)
     } catch (err) {
       job.attempts += 1
       if (job.attempts < 3) {
-        log('warn', `Reintento ${job.attempts} para ${a.alert_id}: ${(err as Error).message}`)
+        log('warn', `Reintento ${job.attempts} para ${job.alert.alert_id}: ${(err as Error).message}`)
         queue.push(job)
         await new Promise(r => setTimeout(r, 1500 * job.attempts))
       } else {
-        log('error', `DESCARTADA tras 3 intentos: ${a.alert_id} — ${(err as Error).message}`)
-        // TODO: notifyHuman(a, err) — email / Telegram
+        log('error', `DESCARTADA tras 3 intentos: ${job.alert.alert_id} — ${(err as Error).message}`)
       }
     }
   }
@@ -116,7 +201,7 @@ async function processQueue(): Promise<void> {
 // ── Servidor HTTP ────────────────────────────────────────────
 
 const app = express()
-app.set('trust proxy', true) // detrás de Traefik (EasyPanel)
+app.set('trust proxy', true)
 app.disable('x-powered-by')
 app.use(express.text({ type: '*/*', limit: '8kb' }))
 
@@ -136,7 +221,7 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
   // Capa 3: esquema
   const parsed = AlertSchema.safeParse(body)
   if (!parsed.success) {
-    log('warn', 'Payload inválido')
+    log('warn', `Payload inválido: ${parsed.error.issues.map(i => i.message).join(', ')}`)
     return res.status(400).send('Bad request')
   }
   const alert = parsed.data
@@ -170,7 +255,7 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
     log('warn', `lots ${alert.lots} > MAX_LOTS ${MAX_LOTS}`)
     return res.status(200).send('OK')
   }
-  if (alert.action !== 'close' && !(alert.sl_pips || DEFAULT_SL > 0)) {
+  if (alert.signal !== 'exit' && alert.action !== 'close' && !(alert.sl_pips || DEFAULT_SL > 0)) {
     log('warn', `Sin stop loss: ${alert.alert_id} rechazada`)
     return res.status(200).send('OK')
   }
@@ -181,7 +266,14 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
   setImmediate(processQueue)
 })
 
-app.get('/health', (_req, res) => res.status(200).json(ctraderStatus()))
+// Estado del motor de señales
+app.get('/health', (_req, res) => {
+  const states: Record<string, ScalperState> = {}
+  for (const [ticker, state] of scalperState) {
+    states[ticker] = state
+  }
+  return res.status(200).json({ ...ctraderStatus(), scalperState: states, killSwitch })
+})
 
 app.post('/admin/kill-switch', express.json(), (req: Request, res: Response) => {
   const token = req.get('authorization')?.replace('Bearer ', '') ?? ''

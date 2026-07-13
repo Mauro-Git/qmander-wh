@@ -323,6 +323,53 @@ export async function closeAll(ticker: string): Promise<number> {
   return positions.length
 }
 
+/**
+ * Cierra posiciones de un símbolo cuyo label empiece con el prefijo indicado.
+ * Ej: closeByLabel('EURUSD', 'smarttrail-') cierra solo Smart Trails.
+ *     closeByLabel('EURUSD', 'scalper-') cierra solo el Scalper.
+ */
+export async function closeByLabel(ticker: string, labelPrefix: string): Promise<number> {
+  if (!connected) throw new Error('Sin conexión con cTrader')
+
+  const symbolId = resolveSymbolId(ticker)
+  const rec = await send(PT.RECONCILE_REQ, { ctidTraderAccountId: cfg.accountId })
+  const allPositions = (rec.payload.position as Array<Record<string, unknown>>) ?? []
+
+  const toClose = allPositions.filter((p) => {
+    const td = p.tradeData as Record<string, unknown> | undefined
+    const label = String(td?.label ?? '')
+    return Number(td?.symbolId) === symbolId && label.startsWith(labelPrefix)
+  })
+
+  for (const p of toClose) {
+    const td = p.tradeData as Record<string, unknown>
+    await send(PT.CLOSE_POSITION_REQ, {
+      ctidTraderAccountId: cfg.accountId,
+      positionId: Number(p.positionId),
+      volume: Number(td.volume),
+    })
+  }
+
+  return toClose.length
+}
+
+/**
+ * Devuelve las posiciones abiertas de un símbolo filtradas por prefijo de label.
+ */
+export async function getPositionsByLabel(ticker: string, labelPrefix: string): Promise<number> {
+  if (!connected) throw new Error('Sin conexión con cTrader')
+
+  const symbolId = resolveSymbolId(ticker)
+  const rec = await send(PT.RECONCILE_REQ, { ctidTraderAccountId: cfg.accountId })
+  const allPositions = (rec.payload.position as Array<Record<string, unknown>>) ?? []
+
+  return allPositions.filter((p) => {
+    const td = p.tradeData as Record<string, unknown> | undefined
+    const label = String(td?.label ?? '')
+    return Number(td?.symbolId) === symbolId && label.startsWith(labelPrefix)
+  }).length
+}
+
 export function ctraderStatus() {
   return { connected, symbols: symbolIdByName.size, requestsToday: requestCount, dayKey }
 }
