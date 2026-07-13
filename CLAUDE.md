@@ -94,21 +94,57 @@ token de webhook, credenciales cTrader (encriptadas), y configuración de riesgo
 4. **Idempotencia** — deduplicación por alert_id
 5. **Riesgo** — símbolos, lotes máx, kill switch (por usuario)
 
-## Payload de alerta TradingView
+## Lógica de señales — Scalper + Smart Trail + Exit
+
+El sistema opera con dos indicadores de TradingView (LuxAlgo): Scalper y Smart Trail.
+El Scalper es el "papá" y los Smart Trail son los "hijos".
+
+### Reglas del motor de señales
+
+**Señal Scalper (buy/sell):**
+- Si NO hay Scalper abierto → abrir 5 contratos, marcar dirección de referencia
+- Si HAY Scalper abierto y la señal es en la MISMA dirección → ignorar
+- Si HAY Scalper abierto y la señal es CONTRARIA → cerrar Scalper anterior +
+  cerrar TODOS los Smart Trail abiertos + abrir nuevo Scalper (5 contratos)
+
+**Señal Smart Trail (buy/sell):**
+- Si coincide con la dirección del Scalper abierto → abrir 3 contratos (acumulables)
+- Si va en contra del Scalper abierto → ignorar, no hacer nada
+- Si no hay Scalper abierto → ignorar
+
+**Señal Exit:**
+- Cerrar ÚNICAMENTE los Smart Trail abiertos
+- El Scalper NO se toca
+- Si no hay Smart Trail abiertos → no hacer nada
+
+### Identificación de posiciones
+Cada orden usa el campo `label` de cTrader para distinguir tipo:
+- Scalper: label = `"scalper-buy"` o `"scalper-sell"`
+- Smart Trail: label = `"smarttrail-buy-{n}"` o `"smarttrail-sell-{n}"`
+Esto permite cerrar selectivamente por tipo.
+
+### Payload de alerta TradingView
 
 ```json
 {
   "secret": "TOKEN_DEL_USUARIO",
-  "alert_id": "{{timenow}}-{{ticker}}-señal",
-  "action": "buy|sell|close",
+  "alert_id": "{{timenow}}-{{ticker}}-scalper",
+  "action": "buy",
+  "signal": "scalper",
   "ticker": "{{ticker}}",
   "price": {{close}},
   "time": {{timenow}},
-  "lots": 0.01,
+  "lots": 5,
   "sl_pips": 20,
   "tp_pips": 40
 }
 ```
+
+Campos:
+- `signal`: `"scalper"` | `"smart_trail"` | `"exit"` (identifica el indicador)
+- `action`: `"buy"` | `"sell"` | `"close"` (dirección de la señal)
+- `lots`: 5 para Scalper, 3 para Smart Trail (configurable por usuario)
+- Para exit: solo se necesitan `signal`, `action: "close"`, `ticker`
 
 ## cTrader Open API — Detalles técnicos
 
