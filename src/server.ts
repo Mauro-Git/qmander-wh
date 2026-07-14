@@ -16,7 +16,7 @@
 import express, { type Request, type Response } from 'express'
 import { timingSafeEqual, createHash } from 'node:crypto'
 import { z } from 'zod'
-import { initCTrader, marketOrder, closeAll, closeByLabel, getPositionsByLabel, ctraderStatus } from './ctrader.js'
+import { initCTrader, marketOrder, closeAll, closeByLabel, getPositionsByLabel, getOpenPositions, ctraderStatus } from './ctrader.js'
 
 // ── Configuración ────────────────────────────────────────────
 
@@ -33,9 +33,13 @@ const ALLOWED_SYMBOLS = new Set(
   (process.env.ALLOWED_SYMBOLS ?? '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 )
 
-const TRADINGVIEW_IPS = new Set([
-  '52.89.214.238', '34.212.75.30', '54.218.53.128', '52.32.178.7',
-])
+const TRADINGVIEW_IPS = new Set(
+  (process.env.TRADINGVIEW_IPS ?? '').split(',').map(s => s.trim()).filter(Boolean)
+)
+if (TRADINGVIEW_IPS.size === 0) {
+  console.error('FATAL: TRADINGVIEW_IPS no definida en .env')
+  process.exit(1)
+}
 
 const MAX_AGE_MS = 60_000
 let killSwitch = false
@@ -56,7 +60,7 @@ const AlertSchema = z.object({
   secret:   z.string().min(32),
   alert_id: z.string().min(8).max(200),
   action:   z.enum(['buy', 'sell', 'close']),
-  signal:   z.enum(['scalper', 'smart_trail', 'exit']),
+  signal:   z.enum(['scalper', 'smart_trail', 'exit', 'close_all']),
   ticker:   z.string().min(1).max(30),
   price:    z.number().positive(),
   time:     z.number().int().positive(),
@@ -168,6 +172,15 @@ async function processSignal(alert: Alert): Promise<void> {
       // El scalper NO se toca
       break
     }
+
+    // ─── CLOSE ALL ────────────────────────────────────────
+    case 'close_all': {
+      const closedScalper = await closeByLabel(ticker, 'scalper-')
+      const closedSmart = await closeByLabel(ticker, 'smarttrail-')
+      scalperState.delete(ticker.toUpperCase())
+      log('info', `[close_all] ${closedScalper} scalper + ${closedSmart} smart trail cerradas en ${ticker} (${alert.alert_id})`)
+      break
+    }
   }
 }
 
@@ -255,10 +268,6 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
     log('warn', `lots ${alert.lots} > MAX_LOTS ${MAX_LOTS}`)
     return res.status(200).send('OK')
   }
-  if (alert.signal !== 'exit' && alert.action !== 'close' && !(alert.sl_pips || DEFAULT_SL > 0)) {
-    log('warn', `Sin stop loss: ${alert.alert_id} rechazada`)
-    return res.status(200).send('OK')
-  }
 
   // Aceptada → responder YA, ejecutar en segundo plano
   res.status(200).send('OK')
@@ -289,8 +298,29 @@ function log(level: 'info' | 'warn' | 'error', msg: string): void {
   console[level === 'info' ? 'log' : level](`[${new Date().toISOString()}] [${level}] ${msg}`)
 }
 
-// ── Arranque: primero cTrader, luego HTTP ────────────────────
+// ── Arranque: primero cTrader, luego reconstruir estado, luego HTTP ──
+
+async function rebuildState(): Promise<void> {
+  const positions = await getOpenPositions()
+  for (const pos of positions) {
+    // Reconstruir estado del Scalper desde las posiciones abiertas
+    if (pos.label.startsWith('scalper-')) {
+      const direction = pos.tradeSide === 1 ? 'buy' : 'sell' as const
+      const ticker = pos.symbolName
+      // Contar Smart Trails existentes para el contador
+      const smartTrails = positions.filter(
+        p => p.symbolId === pos.symbolId && p.label.startsWith('smarttrail-')
+      ).length
+      scalperState.set(ticker, { direction, smartTrailCount: smartTrails })
+      log('info', `[estado] Reconstruido: ${ticker} scalper ${direction}, ${smartTrails} smart trails activos`)
+    }
+  }
+  if (scalperState.size === 0) {
+    log('info', '[estado] Sin posiciones previas — estado limpio')
+  }
+}
 
 initCTrader()
+  .then(() => rebuildState())
   .then(() => app.listen(PORT, () => log('info', `HTTP escuchando en :${PORT}`)))
   .catch((err) => { console.error('FATAL al conectar con cTrader:', err); process.exit(1) })

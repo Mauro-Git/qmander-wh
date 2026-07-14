@@ -153,9 +153,11 @@ Campos:
 - Live: wss://live.ctraderapi.com:5036
 - Heartbeat cada 10s (el servidor cierra conexiones inactivas)
 - PayloadTypes clave: 2100 (AppAuth), 2102 (AccountAuth), 2106 (NewOrder),
-  2110 (ClosePosition), 2114 (SymbolsList), 2116 (SymbolById), 2124 (Reconcile)
+  2111 (ClosePosition), 2114 (SymbolsList), 2116 (SymbolById), 2124 (Reconcile)
+- CUIDADO: 2110 es AmendPositionSLTP, NO ClosePosition (2111). Error original causó "Nothing to amend"
 - Access token expira ~30 días, renovar con refresh token
 - SYMBOL_MAP env var para mapeo TradingView → cTrader (ej: NAS100 → USTEC)
+- int64 en JSON: enviar como Number, NO como String (String rompe el WebSocket)
 
 ## Aprendizajes clave (no repetir estos errores)
 
@@ -166,3 +168,7 @@ Campos:
 - En PowerShell, variables de entorno del .env deben cargarse manualmente con Get-Content
 - `$env:CODE` debe limpiarse entre intentos de OAuth (Remove-Item Env:CODE)
 - EasyPanel con pnpm en Dockerfile falla — usar npm dentro del contenedor
+- PayloadType 2110 = AmendPositionSLTP, 2111 = ClosePosition — off-by-one que causa "Nothing to amend"
+- El scalperState vive en memoria — al reiniciar se pierde. Solución: rebuildState() lee posiciones abiertas de cTrader al arrancar y reconstruye la dirección activa desde los labels
+- SL y TP son opcionales — si no se envían en el JSON, la orden se abre sin protección
+- TRADINGVIEW_IPS se lee desde .env, no hardcodeado en el código

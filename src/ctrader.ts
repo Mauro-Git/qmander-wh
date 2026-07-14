@@ -24,7 +24,7 @@ const PT = {
   ACCOUNT_AUTH_REQ:    2102,
   ACCOUNT_AUTH_RES:    2103,
   NEW_ORDER_REQ:       2106,
-  CLOSE_POSITION_REQ:  2110,
+  CLOSE_POSITION_REQ:  2111,
   SYMBOL_LIST_REQ:     2114,
   SYMBOL_LIST_RES:     2115,
   SYMBOL_BY_ID_REQ:    2116,
@@ -261,29 +261,31 @@ export function resolveSymbolId(ticker: string): number {
 // ── Operaciones de trading ───────────────────────────────────
 
 /**
- * Orden de mercado con stop loss obligatorio y take profit opcional,
+ * Orden de mercado con stop loss y take profit opcionales,
  * ambos relativos en pips. Volumen expresado en lotes.
  */
 export async function marketOrder(params: {
   ticker: string
   side: 'buy' | 'sell'
   lots: number
-  slPips: number
+  slPips?: number
   tpPips?: number
   label?: string
 }): Promise<void> {
   if (!connected) throw new Error('Sin conexión con cTrader')
-  if (params.slPips <= 0) throw new Error('Stop loss obligatorio (slPips > 0)')
 
   const symbolId = resolveSymbolId(params.ticker)
   const det = await getSymbolDetails(symbolId)
 
   const volume = Math.round(params.lots * det.lotSize)
 
-  // relativeStopLoss: distancia en precio × 100000, derivada de pipPosition
   const pipFactor = Math.pow(10, 5 - det.pipPosition)
-  const relativeStopLoss = Math.round(params.slPips * pipFactor)
-  const relativeTakeProfit = params.tpPips ? Math.round(params.tpPips * pipFactor) : undefined
+  const relativeStopLoss = params.slPips && params.slPips > 0
+    ? Math.round(params.slPips * pipFactor)
+    : undefined
+  const relativeTakeProfit = params.tpPips && params.tpPips > 0
+    ? Math.round(params.tpPips * pipFactor)
+    : undefined
 
   const payload: Record<string, unknown> = {
     ctidTraderAccountId: cfg.accountId,
@@ -291,10 +293,10 @@ export async function marketOrder(params: {
     orderType: ORDER_TYPE_MARKET,
     tradeSide: TRADE_SIDE[params.side],
     volume,
-    relativeStopLoss,
     label: params.label ?? 'tv-webhook',
     comment: params.label ?? 'tv-webhook',
   }
+  if (relativeStopLoss) payload.relativeStopLoss = relativeStopLoss
   if (relativeTakeProfit) payload.relativeTakeProfit = relativeTakeProfit
 
   await send(PT.NEW_ORDER_REQ, payload)
@@ -311,16 +313,23 @@ export async function closeAll(ticker: string): Promise<number> {
     return Number(td?.symbolId) === symbolId
   })
 
+  let closed = 0
   for (const p of positions) {
     const td = p.tradeData as Record<string, unknown>
-    await send(PT.CLOSE_POSITION_REQ, {
-      ctidTraderAccountId: cfg.accountId,
-      positionId: Number(p.positionId),
-      volume: Number(td.volume),
-    })
+    try {
+      await send(PT.CLOSE_POSITION_REQ, {
+        ctidTraderAccountId: cfg.accountId,
+        positionId: Number(p.positionId),
+        volume: Number(td.volume),
+      })
+      closed += 1
+    } catch (err) {
+      const msg = (err as Error).message
+      console.log(`[ctrader] Posición ${p.positionId} no se pudo cerrar: ${msg}`)
+    }
   }
 
-  return positions.length
+  return closed
 }
 
 /**
@@ -341,16 +350,23 @@ export async function closeByLabel(ticker: string, labelPrefix: string): Promise
     return Number(td?.symbolId) === symbolId && label.startsWith(labelPrefix)
   })
 
+  let closed = 0
   for (const p of toClose) {
     const td = p.tradeData as Record<string, unknown>
-    await send(PT.CLOSE_POSITION_REQ, {
-      ctidTraderAccountId: cfg.accountId,
-      positionId: Number(p.positionId),
-      volume: Number(td.volume),
-    })
+    try {
+      await send(PT.CLOSE_POSITION_REQ, {
+        ctidTraderAccountId: cfg.accountId,
+        positionId: Number(p.positionId),
+        volume: Number(td.volume),
+      })
+      closed += 1
+    } catch (err) {
+      const msg = (err as Error).message
+      console.log(`[ctrader] Posición ${p.positionId} no se pudo cerrar: ${msg}`)
+    }
   }
 
-  return toClose.length
+  return closed
 }
 
 /**
@@ -372,4 +388,36 @@ export async function getPositionsByLabel(ticker: string, labelPrefix: string): 
 
 export function ctraderStatus() {
   return { connected, symbols: symbolIdByName.size, requestsToday: requestCount, dayKey }
+}
+
+/** Devuelve todas las posiciones abiertas con su label, symbolId y volume. */
+export async function getOpenPositions(): Promise<Array<{
+  positionId: number
+  symbolId: number
+  symbolName: string
+  label: string
+  volume: number
+  tradeSide: number
+}>> {
+  if (!connected) throw new Error('Sin conexión con cTrader')
+
+  const rec = await send(PT.RECONCILE_REQ, { ctidTraderAccountId: cfg.accountId })
+  const allPositions = (rec.payload.position as Array<Record<string, unknown>>) ?? []
+
+  // Invertir el mapa de símbolos para resolver nombre desde ID
+  const nameById = new Map<number, string>()
+  for (const [name, id] of symbolIdByName) nameById.set(id, name)
+
+  return allPositions.map((p) => {
+    const td = p.tradeData as Record<string, unknown>
+    const symId = Number(td.symbolId)
+    return {
+      positionId: Number(p.positionId),
+      symbolId: symId,
+      symbolName: nameById.get(symId) ?? String(symId),
+      label: String(td.label ?? ''),
+      volume: Number(td.volume),
+      tradeSide: Number(td.tradeSide),
+    }
+  })
 }

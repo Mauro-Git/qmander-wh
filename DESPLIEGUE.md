@@ -93,28 +93,136 @@ pnpm dev
    # → {"connected":true,"symbols":NNN,...}
    ```
 
-## 5. Alerta en TradingView
+## 5. Motor de señales — Scalper + Smart Trail + Exit
+
+El sistema opera con dos indicadores de TradingView (Scalper y Smart Trail)
+más una señal de salida (Exit). Cada alerta incluye un campo `signal` que
+identifica el indicador de origen.
+
+### Tipos de señal
+
+| signal       | action | Qué cierra                         | Qué abre                        |
+|--------------|--------|-------------------------------------|----------------------------------|
+| `scalper`    | buy    | Si había Sell: Scalper + Smart Trails | 5 contratos Buy               |
+| `scalper`    | sell   | Si había Buy: Scalper + Smart Trails  | 5 contratos Sell              |
+| `smart_trail`| buy    | Nada                                | 3 contratos (si Scalper es Buy) |
+| `smart_trail`| sell   | Nada                                | 3 contratos (si Scalper es Sell)|
+| `exit`       | close  | Solo Smart Trails                   | Nada                            |
+| `close_all`  | close  | Todo (Scalper + Smart Trails)       | Nada                            |
+
+### Reglas clave
+
+- El Scalper NUNCA se cierra manualmente. Solo se cierra cuando llega un
+  Scalper en dirección contraria.
+- Los Smart Trail solo abren si coinciden con la dirección del Scalper activo.
+  Si van en contra, se ignoran.
+- Exit cierra solo Smart Trails. El Scalper no se toca.
+- Close All es el botón de emergencia: cierra todo y limpia el estado.
+
+### Stop Loss y Take Profit (opcionales)
+
+Los campos `sl_pips` y `tp_pips` son opcionales en todas las señales:
+
+| En el JSON                        | Resultado                     |
+|-----------------------------------|-------------------------------|
+| `"sl_pips": 50`                   | Orden con SL a 50 pips        |
+| `"sl_pips": 50, "tp_pips": 100`   | Orden con SL y TP             |
+| Sin `sl_pips` ni `tp_pips`        | Orden sin protección          |
+| `"tp_pips": 100` (sin SL)         | Orden solo con TP             |
+
+### Alertas en TradingView
 
 Webhook URL: `https://hooks.tudominio.com/webhook/tradingview`
 
-Mensaje (compra):
+Trigger: **Once Per Bar Close** (en todas las alertas).
+
+**Alerta Scalper Buy:**
 ```json
 {
   "secret": "TU_WEBHOOK_SECRET",
-  "alert_id": "{{timenow}}-{{ticker}}-señal-compra",
+  "alert_id": "{{timenow}}-{{ticker}}-scalper-buy",
   "action": "buy",
+  "signal": "scalper",
   "ticker": "{{ticker}}",
   "price": {{close}},
   "time": {{timenow}},
-  "lots": 0.01,
-  "sl_pips": 20,
-  "tp_pips": 40
+  "lots": 5,
+  "sl_pips": 50,
+  "tp_pips": 100
 }
 ```
-Para venta: `"action": "sell"`. Para cerrar posiciones del símbolo:
-`"action": "close"` (no requiere lots/sl).
+> `sl_pips` y `tp_pips` son opcionales. Si no los incluyes, la orden se abre sin protección.
 
-Trigger: **Once Per Bar Close**.
+**Alerta Scalper Sell:**
+```json
+{
+  "secret": "TU_WEBHOOK_SECRET",
+  "alert_id": "{{timenow}}-{{ticker}}-scalper-sell",
+  "action": "sell",
+  "signal": "scalper",
+  "ticker": "{{ticker}}",
+  "price": {{close}},
+  "time": {{timenow}},
+  "lots": 5
+}
+```
+> Ejemplo sin SL ni TP — la orden se abre sin protección.
+
+**Alerta Smart Trail Buy:**
+```json
+{
+  "secret": "TU_WEBHOOK_SECRET",
+  "alert_id": "{{timenow}}-{{ticker}}-smart-buy",
+  "action": "buy",
+  "signal": "smart_trail",
+  "ticker": "{{ticker}}",
+  "price": {{close}},
+  "time": {{timenow}},
+  "lots": 3,
+  "sl_pips": 50
+}
+```
+> Ejemplo solo con SL, sin TP.
+
+**Alerta Smart Trail Sell:**
+```json
+{
+  "secret": "TU_WEBHOOK_SECRET",
+  "alert_id": "{{timenow}}-{{ticker}}-smart-sell",
+  "action": "sell",
+  "signal": "smart_trail",
+  "ticker": "{{ticker}}",
+  "price": {{close}},
+  "time": {{timenow}},
+  "lots": 3
+}
+```
+
+**Alerta Exit (cierra solo Smart Trails):**
+```json
+{
+  "secret": "TU_WEBHOOK_SECRET",
+  "alert_id": "{{timenow}}-{{ticker}}-exit",
+  "action": "close",
+  "signal": "exit",
+  "ticker": "{{ticker}}",
+  "price": {{close}},
+  "time": {{timenow}}
+}
+```
+
+**Cerrar todo (Scalper + Smart Trails):**
+```json
+{
+  "secret": "TU_WEBHOOK_SECRET",
+  "alert_id": "{{timenow}}-{{ticker}}-close-all",
+  "action": "close",
+  "signal": "close_all",
+  "ticker": "{{ticker}}",
+  "price": {{close}},
+  "time": {{timenow}}
+}
+```
 
 ## 6. Kill switch
 
@@ -160,35 +268,200 @@ Para operar en FTMO con cTrader, solo necesitas:
 4. Bajar `MAX_DAILY_REQUESTS` a 1500 o menos (FTMO prohíbe >2000/día).
 5. Implementar validaciones adicionales de drawdown diario/total.
 
-## 9. Secuencia de pruebas recomendada
+## 9. Pruebas desde Postman
 
-1. `curl` manual al webhook (comentar filtro IP temporalmente o agregar
-   tu IP para pruebas).
-2. Alerta real de TradingView → verificar orden en cTrader **demo**.
-3. Semanas en demo midiendo: fills, slippage, símbolos, SL/TP correctos.
-4. Solo entonces, evaluar cuenta real.
+### Configurar timestamp automático
 
+En Postman, pestaña **Pre-request Script** de cada request:
+```javascript
+pm.environment.set("timestamp", Date.now().toString())
+```
 
-##  10. Comandos utiles powershell
+Luego en el JSON usa `{{timestamp}}` en los campos `time` y `alert_id`.
+Esto evita el error "Fuera de ventana" por timestamp expirado.
 
-# Health del Webhook 
-  Invoke-RestMethod https://wh.qmander.com/health
-  
-# Generar Webhook secret
-  -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Max 256) }) 
+### Agregar IPs locales (solo para pruebas)
 
-# URL Webhook
-  https://wh.qmander.com/webhook/tradingview
+Para probar desde tu PC, agrega temporalmente en `src/server.ts`:
+```typescript
+TRADINGVIEW_IPS.add('127.0.0.1')
+TRADINGVIEW_IPS.add('::1')
+TRADINGVIEW_IPS.add('::ffff:127.0.0.1')
+```
+**Quitar antes de hacer push a producción.**
 
-# Obtener TimeStamp
-  [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+### Secuencia de prueba completa
 
-# Cargar variables e inicial local
+Enviar en orden desde Postman contra `http://localhost:3000/webhook/tradingview`:
+
+**Paso 1 — Scalper Buy (abre 5 contratos):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-scalper-buy",
+  "action": "buy",
+  "signal": "scalper",
+  "ticker": "NAS100",
+  "price": 22000,
+  "time": {{timestamp}},
+  "lots": 5,
+  "sl_pips": 500,
+  "tp_pips": 1000
+}
+```
+Log esperado: `[scalper] NUEVO buy 5 lotes NAS100`
+
+**Paso 2 — Smart Trail Buy (abre 3 más):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-smart-buy-1",
+  "action": "buy",
+  "signal": "smart_trail",
+  "ticker": "NAS100",
+  "price": 22050,
+  "time": {{timestamp}},
+  "lots": 3,
+  "sl_pips": 500,
+  "tp_pips": 1000
+}
+```
+Log esperado: `[smart_trail] buy 3 lotes NAS100 label=smarttrail-buy-1`
+
+**Paso 3 — Exit (cierra solo Smart Trail):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-exit-1",
+  "action": "close",
+  "signal": "exit",
+  "ticker": "NAS100",
+  "price": 22030,
+  "time": {{timestamp}}
+}
+```
+Log esperado: `[exit] 1 smart trail cerradas en NAS100`
+
+**Paso 4 — Smart Trail Sell (se ignora, Scalper es Buy):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-smart-sell-1",
+  "action": "sell",
+  "signal": "smart_trail",
+  "ticker": "NAS100",
+  "price": 22020,
+  "time": {{timestamp}},
+  "lots": 3,
+  "sl_pips": 500,
+  "tp_pips": 1000
+}
+```
+Log esperado: `[smart_trail] IGNORADO: sell contra scalper buy en NAS100`
+
+**Paso 5 — Smart Trail Buy (abre otros 3):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-smart-buy-2",
+  "action": "buy",
+  "signal": "smart_trail",
+  "ticker": "NAS100",
+  "price": 22060,
+  "time": {{timestamp}},
+  "lots": 3,
+  "sl_pips": 500,
+  "tp_pips": 1000
+}
+```
+Log esperado: `[smart_trail] buy 3 lotes NAS100 label=smarttrail-buy-2`
+
+**Paso 6 — Scalper Sell (reversa: cierra todo + abre Sell):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-scalper-sell",
+  "action": "sell",
+  "signal": "scalper",
+  "ticker": "NAS100",
+  "price": 21950,
+  "time": {{timestamp}},
+  "lots": 5,
+  "sl_pips": 500,
+  "tp_pips": 1000
+}
+```
+Log esperado:
+```
+[scalper] REVERSA: cerradas 1 scalper + 1 smart trail en NAS100
+[scalper] NUEVO sell 5 lotes NAS100
+```
+
+**Paso 7 — Close All (limpia todo):**
+```json
+{
+  "secret": "{{webhooksecret}}",
+  "alert_id": "{{timestamp}}-NAS100-close-all",
+  "action": "close",
+  "signal": "close_all",
+  "ticker": "NAS100",
+  "price": 21950,
+  "time": {{timestamp}}
+}
+```
+Log esperado: `[close_all] 1 scalper + 0 smart trail cerradas en NAS100`
+
+### Verificación en cTrader
+
+Después de cada paso, verifica en https://ct.pepperstone.com:
+- Posiciones abiertas con los lotes correctos
+- Labels de las posiciones (`scalper-buy`, `smarttrail-buy-1`, etc.)
+- SL y TP a la distancia esperada (si se enviaron en el JSON)
+- Que el `/health` muestre el estado correcto del Scalper
+
+### Notas sobre las pruebas
+
+- Se usa `sl_pips: 500` (amplio) para evitar que las posiciones se
+  cierren por SL entre pasos de prueba.
+- Si el símbolo NAS100 no se encuentra, configurar `SYMBOL_MAP` en `.env`:
+  `SYMBOL_MAP={"NAS100":"USTEC"}` (o el nombre que use cTrader).
+- Si una posición ya se cerró por SL/TP antes de recibir la señal de
+  cierre, el sistema lo detecta y continúa sin error.
+
+## 10. Pruebas con TradingView (producción)
+
+1. Quitar las IPs de prueba locales de `server.ts`.
+2. Hacer push al repo → EasyPanel redespliega.
+3. Verificar `/health` en la URL del VPS.
+4. Crear las alertas en TradingView (una por señal) con los JSON de
+   la sección 5, apuntando al webhook del VPS.
+5. Dejar correr en demo semanas midiendo: fills, slippage, símbolos,
+   SL/TP correctos, y que la lógica Scalper/Smart Trail se ejecute
+   como se espera.
+6. Solo entonces, evaluar cuenta real.
+## 11. Comandos útiles PowerShell
+
+```powershell
+# Health del webhook
+Invoke-RestMethod https://wh.qmander.com/health
+
+# Generar webhook secret
+-join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Max 256) })
+
+# URL del webhook
+# https://wh.qmander.com/webhook/tradingview
+
+# Obtener timestamp actual (milisegundos)
+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
+# Cargar variables de entorno desde .env
 Get-Content .env | ForEach-Object {
   if ($_ -match '^([^#][^=]+)=(.*)$') {
     [Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), "Process")
   }
 }
-pnpm dev (desarrollo)
-pnpm start (producción)
 
+# Arrancar servidor
+pnpm dev     # desarrollo (hot reload)
+pnpm start   # producción
+```
