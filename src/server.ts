@@ -57,12 +57,13 @@ const scalperState = new Map<string, ScalperState>()
 // ── Esquema del payload ──────────────────────────────────────
 
 const AlertSchema = z.object({
+  secret:   z.string().min(32),
   alert_id: z.string().min(8).max(200),
   action:   z.enum(['buy', 'sell', 'close']),
   signal:   z.enum(['scalper', 'smart_trail', 'exit', 'close_all']),
   ticker:   z.string().min(1).max(30),
   price:    z.number().positive(),
-  time:     z.number().int().positive(),
+  time:     z.string(),  // ISO format: "2026-07-22T02:06:00Z"
   lots:     z.number().positive().optional(),
   sl_pips:  z.number().positive().optional(),
   tp_pips:  z.number().positive().optional(),
@@ -257,7 +258,12 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
   }
 
   // Capa 3: frescura
-  const age = Date.now() - alert.time
+  const alertTime = new Date(alert.time).getTime()
+  if (isNaN(alertTime)) {
+    log('warn', `Fecha inválida: ${alert.time} (${alert.alert_id})`)
+    return res.status(200).send('OK')
+  }
+  const age = Date.now() - alertTime
   if (age > MAX_AGE_MS || age < -10_000) {
     log('warn', `Fuera de ventana (${age} ms): ${alert.alert_id}`)
     return res.status(200).send('OK')
