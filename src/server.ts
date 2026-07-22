@@ -57,7 +57,6 @@ const scalperState = new Map<string, ScalperState>()
 // ── Esquema del payload ──────────────────────────────────────
 
 const AlertSchema = z.object({
-  secret:   z.string().min(32),
   alert_id: z.string().min(8).max(200),
   action:   z.enum(['buy', 'sell', 'close']),
   signal:   z.enum(['scalper', 'smart_trail', 'exit', 'close_all']),
@@ -235,8 +234,13 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
 
   // Parseo
   let body: unknown
-  try { body = JSON.parse(typeof req.body === 'string' ? req.body : '') }
-  catch { return res.status(400).send('Bad request') }
+  const rawBody = typeof req.body === 'string' ? req.body : ''
+  try { body = JSON.parse(rawBody) }
+  catch (err) {
+    log('warn', `JSON inválido: ${(err as Error).message}`)
+    log('warn', `Body crudo (primeros 200 chars): ${rawBody.slice(0, 200)}`)
+    return res.status(400).send('Bad request')
+  }
 
   // Capa 3: esquema
   const parsed = AlertSchema.safeParse(body)
