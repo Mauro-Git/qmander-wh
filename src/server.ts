@@ -216,6 +216,13 @@ async function processQueue(): Promise<void> {
 const app = express()
 app.set('trust proxy', true)
 app.disable('x-powered-by')
+
+// Debug: loguear TODA petición que llegue a Express (quitar después de diagnosticar)
+app.use((req, _res, next) => {
+  log('info', `[incoming] ${req.method} ${req.path} from ${req.ip} Content-Type: ${req.get('content-type') ?? 'none'} User-Agent: ${req.get('user-agent') ?? 'none'}`)
+  next()
+})
+
 app.use(express.text({ type: '*/*', limit: '8kb' }))
 
 app.post('/webhook/tradingview', (req: Request, res: Response) => {
@@ -290,6 +297,12 @@ app.post('/admin/kill-switch', express.json(), (req: Request, res: Response) => 
   killSwitch = Boolean((req.body as { enabled?: boolean }).enabled)
   log('warn', `Kill switch = ${killSwitch}`)
   return res.status(200).json({ killSwitch })
+})
+
+// Catch-all: loguear cualquier petición que no coincida con las rutas anteriores
+app.all('*', (req: Request, res: Response) => {
+  log('warn', `[catch-all] ${req.method} ${req.path} — ruta no encontrada`)
+  return res.status(404).send('Not found')
 })
 
 // ── Utilidades ───────────────────────────────────────────────
