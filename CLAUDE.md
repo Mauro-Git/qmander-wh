@@ -9,10 +9,11 @@ Los usuarios NO son desarrolladores — son traders que necesitan una interfaz s
 ## Estado actual (funcionando en producción)
 
 El receptor de webhooks está desplegado y operativo:
-- **URL live**: https://qmander-tradingview-bridge-tradingview-bridge.pommed.easypanel.host/
-- **Cuenta demo Pepperstone**: 47603328
-- **Funcionalidad probada**: buy, sell, close en EURUSD (demo)
-- **Pendiente de probar**: NAS100 (nombre puede ser USTEC en cTrader)
+- **URL live**: https://wh.qmander.com/ (también https://qmander-tradingview-bridge-tradingview-bridge.pommed.easypanel.host/)
+- **Multi-cuenta**: soporta N cuentas simultáneas, cada señal se ejecuta en todas
+- **Cuentas activas**: configuradas en CTRADER_ACCOUNTS (JSON array en .env)
+- **Funcionalidad probada**: Scalper buy/sell, Smart Trail buy/sell, Exit, Close All en NAS100
+- **Motor de señales**: Scalper (papá) + Smart Trail (hijos) + Exit, con reconstrucción de estado al reiniciar
 - **Stack actual**: Express.js, WebSocket (`ws`) + JSON (puerto 5036), Zod
 - **Sin dependencias vulnerables**: eliminamos `@reiryoku/ctrader-layer`, `protobufjs`, `axios`
 
@@ -151,6 +152,9 @@ Campos:
 - Conexión: WebSocket + JSON al puerto 5036 (NO Protobuf puerto 5035)
 - Demo: wss://demo.ctraderapi.com:5036
 - Live: wss://live.ctraderapi.com:5036
+- **Multi-cuenta**: ctrader.ts usa clase CTraderAccount, una instancia por cuenta.
+  Cuentas configuradas en CTRADER_ACCOUNTS (JSON array en .env).
+  Funciones *All (marketOrderAll, closeByLabelAll, etc.) ejecutan en todas las cuentas.
 - Heartbeat cada 10s (el servidor cierra conexiones inactivas)
 - PayloadTypes clave: 2100 (AppAuth), 2102 (AccountAuth), 2106 (NewOrder),
   2111 (ClosePosition), 2114 (SymbolsList), 2116 (SymbolById), 2124 (Reconcile)
@@ -158,6 +162,23 @@ Campos:
 - Access token expira ~30 días, renovar con refresh token
 - SYMBOL_MAP env var para mapeo TradingView → cTrader (ej: NAS100 → USTEC)
 - int64 en JSON: enviar como Number, NO como String (String rompe el WebSocket)
+
+## Configuración multi-cuenta (.env)
+
+```
+# Todas las cuentas comparten clientId/clientSecret (una sola app de Spotware)
+CTRADER_HOST=demo.ctraderapi.com
+CTRADER_CLIENT_ID=xxx
+CTRADER_CLIENT_SECRET=yyy
+
+# Cada cuenta tiene su propio accessToken y accountId
+CTRADER_ACCOUNTS=[{"name":"Mauro","accessToken":"TOKEN_1","accountId":47603328},{"name":"Juan","accessToken":"TOKEN_2","accountId":12345678}]
+```
+
+Para agregar una cuenta nueva:
+1. El colaborador autoriza la app de Spotware con su cTrader ID (flujo OAuth)
+2. Se obtiene su accessToken y ctidTraderAccountId
+3. Se agrega al JSON array de CTRADER_ACCOUNTS
 
 ## Aprendizajes clave (no repetir estos errores)
 
@@ -172,3 +193,6 @@ Campos:
 - El scalperState vive en memoria — al reiniciar se pierde. Solución: rebuildState() lee posiciones abiertas de cTrader al arrancar y reconstruye la dirección activa desde los labels
 - SL y TP son opcionales — si no se envían en el JSON, la orden se abre sin protección
 - TRADINGVIEW_IPS se lee desde .env, no hardcodeado en el código
+- TradingView bloquea webhooks con datos que parecen tokens/passwords en el body — el secret funciona si el JSON llega como una línea sin saltos
+- `{{timenow}}` de TradingView devuelve ISO string (2026-07-22T02:06:00Z), NO Unix timestamp — poner entre comillas en el JSON: `"time":"{{timenow}}"`
+- TradingView envía Content-Type text/plain si el JSON tiene placeholders sin comillas ({{close}}) — nuestro servidor acepta ambos
