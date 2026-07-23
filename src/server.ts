@@ -1,7 +1,8 @@
 /**
- * Receptor de webhooks TradingView → cTrader Open API
- * ────────────────────────────────────────────────────
+ * Receptor de webhooks TradingView → cTrader Open API (Multi-cuenta)
+ * ──────────────────────────────────────────────────────────────────
  * Motor de señales: Scalper (papá) + Smart Trail (hijos) + Exit
+ * Ejecuta en TODAS las cuentas configuradas en CTRADER_ACCOUNTS.
  *
  * Capas de seguridad:
  *   1. Filtro de IP de origen (TradingView)
@@ -9,14 +10,12 @@
  *   3. Esquema estricto (zod) + frescura temporal
  *   4. Anti-duplicados (idempotencia)
  *   5. Límites de riesgo + kill switch
- *
- * Luego: respuesta 200 inmediata → cola asíncrona → motor de reglas → cTrader.
  */
 
 import express, { type Request, type Response } from 'express'
 import { timingSafeEqual, createHash } from 'node:crypto'
 import { z } from 'zod'
-import { initCTrader, marketOrder, closeAll, closeByLabel, getPositionsByLabel, getOpenPositions, ctraderStatus } from './ctrader.js'
+import { initAllAccounts, marketOrderAll, closeByLabelAll, getOpenPositionsAll, allAccountsStatus } from './ctrader.js'
 
 // ── Configuración ────────────────────────────────────────────
 
@@ -28,11 +27,9 @@ if (WEBHOOK_SECRET.length < 32) {
 
 const PORT        = Number(process.env.PORT ?? 3000)
 const MAX_LOTS    = Number(process.env.MAX_LOTS ?? 5)
-const DEFAULT_SL  = Number(process.env.DEFAULT_SL_PIPS ?? 0)
 const ALLOWED_SYMBOLS = new Set(
   (process.env.ALLOWED_SYMBOLS ?? '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 )
-
 const TRADINGVIEW_IPS = new Set(
   (process.env.TRADINGVIEW_IPS ?? '').split(',').map(s => s.trim()).filter(Boolean)
 )
@@ -48,10 +45,9 @@ let killSwitch = false
 
 interface ScalperState {
   direction: 'buy' | 'sell'
-  smartTrailCount: number  // contador para labels únicos
+  smartTrailCount: number
 }
 
-// Mapa: ticker → estado del scalper activo
 const scalperState = new Map<string, ScalperState>()
 
 // ── Esquema del payload ──────────────────────────────────────
@@ -94,36 +90,30 @@ async function processSignal(alert: Alert): Promise<void> {
   const state = scalperState.get(ticker.toUpperCase())
 
   switch (alert.signal) {
-    // ─── SCALPER ───────────────────────────────────────────
     case 'scalper': {
       const side = alert.action as 'buy' | 'sell'
       const lots = alert.lots ?? 5
 
       if (!state) {
-        // No hay Scalper abierto → abrir nuevo
-        await marketOrder({
+        await marketOrderAll({
           ticker, side, lots,
-          slPips: alert.sl_pips ?? DEFAULT_SL,
-          tpPips: alert.tp_pips,
+          slPips: alert.sl_pips, tpPips: alert.tp_pips,
           label: `scalper-${side}`,
         })
         scalperState.set(ticker.toUpperCase(), { direction: side, smartTrailCount: 0 })
         log('info', `[scalper] NUEVO ${side} ${lots} lotes ${ticker} (${alert.alert_id})`)
 
       } else if (state.direction === side) {
-        // Misma dirección → ignorar
         log('info', `[scalper] IGNORADO: ya hay scalper ${side} en ${ticker} (${alert.alert_id})`)
 
       } else {
-        // Dirección contraria → cerrar todo y abrir nuevo
-        const closedScalper = await closeByLabel(ticker, 'scalper-')
-        const closedSmart = await closeByLabel(ticker, 'smarttrail-')
+        const closedScalper = await closeByLabelAll(ticker, 'scalper-')
+        const closedSmart = await closeByLabelAll(ticker, 'smarttrail-')
         log('info', `[scalper] REVERSA: cerradas ${closedScalper} scalper + ${closedSmart} smart trail en ${ticker}`)
 
-        await marketOrder({
+        await marketOrderAll({
           ticker, side, lots,
-          slPips: alert.sl_pips ?? DEFAULT_SL,
-          tpPips: alert.tp_pips,
+          slPips: alert.sl_pips, tpPips: alert.tp_pips,
           label: `scalper-${side}`,
         })
         scalperState.set(ticker.toUpperCase(), { direction: side, smartTrailCount: 0 })
@@ -132,7 +122,6 @@ async function processSignal(alert: Alert): Promise<void> {
       break
     }
 
-    // ─── SMART TRAIL ──────────────────────────────────────
     case 'smart_trail': {
       const side = alert.action as 'buy' | 'sell'
       const lots = alert.lots ?? 3
@@ -141,42 +130,36 @@ async function processSignal(alert: Alert): Promise<void> {
         log('info', `[smart_trail] IGNORADO: no hay scalper activo en ${ticker} (${alert.alert_id})`)
         break
       }
-
       if (side !== state.direction) {
         log('info', `[smart_trail] IGNORADO: ${side} contra scalper ${state.direction} en ${ticker} (${alert.alert_id})`)
         break
       }
 
-      // Misma dirección que el scalper → abrir posición
       state.smartTrailCount += 1
       const label = `smarttrail-${side}-${state.smartTrailCount}`
 
-      await marketOrder({
+      await marketOrderAll({
         ticker, side, lots,
-        slPips: alert.sl_pips ?? DEFAULT_SL,
-        tpPips: alert.tp_pips,
+        slPips: alert.sl_pips, tpPips: alert.tp_pips,
         label,
       })
       log('info', `[smart_trail] ${side} ${lots} lotes ${ticker} label=${label} (${alert.alert_id})`)
       break
     }
 
-    // ─── EXIT ─────────────────────────────────────────────
     case 'exit': {
-      const closedSmart = await closeByLabel(ticker, 'smarttrail-')
+      const closedSmart = await closeByLabelAll(ticker, 'smarttrail-')
       if (closedSmart > 0) {
         log('info', `[exit] ${closedSmart} smart trail cerradas en ${ticker} (${alert.alert_id})`)
       } else {
         log('info', `[exit] No hay smart trail abiertos en ${ticker} (${alert.alert_id})`)
       }
-      // El scalper NO se toca
       break
     }
 
-    // ─── CLOSE ALL ────────────────────────────────────────
     case 'close_all': {
-      const closedScalper = await closeByLabel(ticker, 'scalper-')
-      const closedSmart = await closeByLabel(ticker, 'smarttrail-')
+      const closedScalper = await closeByLabelAll(ticker, 'scalper-')
+      const closedSmart = await closeByLabelAll(ticker, 'smarttrail-')
       scalperState.delete(ticker.toUpperCase())
       log('info', `[close_all] ${closedScalper} scalper + ${closedSmart} smart trail cerradas en ${ticker} (${alert.alert_id})`)
       break
@@ -217,7 +200,7 @@ const app = express()
 app.set('trust proxy', true)
 app.disable('x-powered-by')
 
-// Debug: loguear TODA petición que llegue a Express (quitar después de diagnosticar)
+// Debug: loguear toda petición (quitar después de diagnosticar)
 app.use((req, _res, next) => {
   log('info', `[incoming] ${req.method} ${req.path} from ${req.ip} Content-Type: ${req.get('content-type') ?? 'none'} User-Agent: ${req.get('user-agent') ?? 'none'}`)
   next()
@@ -292,13 +275,13 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
   setImmediate(processQueue)
 })
 
-// Estado del motor de señales
+// Estado de todas las cuentas
 app.get('/health', (_req, res) => {
   const states: Record<string, ScalperState> = {}
   for (const [ticker, state] of scalperState) {
     states[ticker] = state
   }
-  return res.status(200).json({ ...ctraderStatus(), scalperState: states, killSwitch })
+  return res.status(200).json({ accounts: allAccountsStatus(), scalperState: states, killSwitch })
 })
 
 app.post('/admin/kill-switch', express.json(), (req: Request, res: Response) => {
@@ -309,7 +292,7 @@ app.post('/admin/kill-switch', express.json(), (req: Request, res: Response) => 
   return res.status(200).json({ killSwitch })
 })
 
-// Catch-all: loguear cualquier petición que no coincida con las rutas anteriores
+// Catch-all
 app.all('*', (req: Request, res: Response) => {
   log('warn', `[catch-all] ${req.method} ${req.path} — ruta no encontrada`)
   return res.status(404).send('Not found')
@@ -321,21 +304,21 @@ function log(level: 'info' | 'warn' | 'error', msg: string): void {
   console[level === 'info' ? 'log' : level](`[${new Date().toISOString()}] [${level}] ${msg}`)
 }
 
-// ── Arranque: primero cTrader, luego reconstruir estado, luego HTTP ──
+// ── Arranque ─────────────────────────────────────────────────
 
 async function rebuildState(): Promise<void> {
-  const positions = await getOpenPositions()
+  const positions = await getOpenPositionsAll()
   for (const pos of positions) {
-    // Reconstruir estado del Scalper desde las posiciones abiertas
     if (pos.label.startsWith('scalper-')) {
       const direction = pos.tradeSide === 1 ? 'buy' : 'sell' as const
       const ticker = pos.symbolName
-      // Contar Smart Trails existentes para el contador
       const smartTrails = positions.filter(
         p => p.symbolId === pos.symbolId && p.label.startsWith('smarttrail-')
       ).length
-      scalperState.set(ticker, { direction, smartTrailCount: smartTrails })
-      log('info', `[estado] Reconstruido: ${ticker} scalper ${direction}, ${smartTrails} smart trails activos`)
+      if (!scalperState.has(ticker)) {
+        scalperState.set(ticker, { direction, smartTrailCount: smartTrails })
+        log('info', `[estado] Reconstruido: ${ticker} scalper ${direction}, ${smartTrails} smart trails activos`)
+      }
     }
   }
   if (scalperState.size === 0) {
@@ -343,7 +326,7 @@ async function rebuildState(): Promise<void> {
   }
 }
 
-initCTrader()
+initAllAccounts()
   .then(() => rebuildState())
   .then(() => app.listen(PORT, () => log('info', `HTTP escuchando en :${PORT}`)))
-  .catch((err) => { console.error('FATAL al conectar con cTrader:', err); process.exit(1) })
+  .catch((err) => { console.error('FATAL:', err); process.exit(1) })
