@@ -14,6 +14,8 @@
 
 import express, { type Request, type Response } from 'express'
 import { timingSafeEqual, createHash } from 'node:crypto'
+import { appendFileSync, readFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { initAllAccounts, marketOrderAll, closeByLabelAll, getOpenPositionsAll, allAccountsStatus } from './ctrader.js'
 
@@ -294,6 +296,34 @@ app.post('/admin/kill-switch', express.json(), (req: Request, res: Response) => 
   return res.status(200).json({ killSwitch })
 })
 
+// Consultar logs por fecha: GET /admin/logs/2026-07-23
+app.get('/admin/logs/:date?', (req: Request, res: Response) => {
+  const token = req.get('authorization')?.replace('Bearer ', '') ?? ''
+  if (!secretMatches(token)) return res.status(404).send('Not found')
+
+  const date = req.params.date ?? new Date().toISOString().slice(0, 10)
+  const filepath = join(LOG_DIR, `${date}.log`)
+
+  if (!existsSync(filepath)) {
+    return res.status(200).send(`No hay logs para ${date}`)
+  }
+
+  const content = readFileSync(filepath, 'utf-8')
+  res.set('Content-Type', 'text/plain')
+  return res.status(200).send(content)
+})
+
+// Listar archivos de log disponibles
+app.get('/admin/logs-list', (req: Request, res: Response) => {
+  const token = req.get('authorization')?.replace('Bearer ', '') ?? ''
+  if (!secretMatches(token)) return res.status(404).send('Not found')
+
+  const files = existsSync(LOG_DIR) 
+    ? readdirSync(LOG_DIR).filter(f => f.endsWith('.log')).sort().reverse()
+    : []
+  return res.status(200).json({ files })
+})
+
 // Catch-all
 app.all('*', (req: Request, res: Response) => {
   log('warn', `[catch-all] ${req.method} ${req.path} — ruta no encontrada`)
@@ -302,8 +332,21 @@ app.all('*', (req: Request, res: Response) => {
 
 // ── Utilidades ───────────────────────────────────────────────
 
+const LOG_DIR = process.env.LOG_DIR ?? '/app/logs'
+if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true })
+
 function log(level: 'info' | 'warn' | 'error', msg: string): void {
-  console[level === 'info' ? 'log' : level](`[${new Date().toISOString()}] [${level}] ${msg}`)
+  const now = new Date()
+  const line = `[${now.toISOString()}] [${level}] ${msg}\n`
+
+  // Consola
+  console[level === 'info' ? 'log' : level](line.trimEnd())
+
+  // Archivo diario (ej: 2026-07-23.log)
+  const filename = `${now.toISOString().slice(0, 10)}.log`
+  try {
+    appendFileSync(join(LOG_DIR, filename), line)
+  } catch { /* no romper el servidor si falla la escritura */ }
 }
 
 // ── Arranque ─────────────────────────────────────────────────
