@@ -14,8 +14,32 @@ El receptor de webhooks está desplegado y operativo:
 - **Cuentas activas**: configuradas en CTRADER_ACCOUNTS (JSON array en .env)
 - **Funcionalidad probada**: Scalper buy/sell, Smart Trail buy/sell, Exit, Close All en NAS100
 - **Motor de señales**: Scalper (papá) + Smart Trail (hijos) + Exit, con reconstrucción de estado al reiniciar
+- **Logs**: archivos diarios en `/app/logs/YYYY-MM-DD.log`, volumen persistente en EasyPanel
 - **Stack actual**: Express.js, WebSocket (`ws`) + JSON (puerto 5036), Zod
 - **Sin dependencias vulnerables**: eliminamos `@reiryoku/ctrader-layer`, `protobufjs`, `axios`
+
+## Logs y monitoreo
+
+Logs se escriben a consola Y a archivos diarios en `/app/logs/` (volumen persistente en EasyPanel).
+Cada alerta aceptada loguea el desfase en segundos con TradingView.
+
+### Endpoints de logs (requieren Authorization: Bearer WEBHOOK_SECRET)
+- `GET /admin/logs` — logs de hoy
+- `GET /admin/logs/2026-07-23` — logs de una fecha específica
+- `GET /admin/logs-list` — listar archivos de log disponibles
+- `GET /health` — estado de cuentas, scalperState, killSwitch
+
+### Consultar desde PowerShell
+```powershell
+# Logs de hoy
+Invoke-RestMethod -Uri "https://wh.qmander.com/admin/logs" -Headers @{Authorization="Bearer TU_WEBHOOK_SECRET"}
+
+# Logs de una fecha
+Invoke-RestMethod -Uri "https://wh.qmander.com/admin/logs/2026-07-22" -Headers @{Authorization="Bearer TU_WEBHOOK_SECRET"}
+
+# Listar archivos disponibles
+Invoke-RestMethod -Uri "https://wh.qmander.com/admin/logs-list" -Headers @{Authorization="Bearer TU_WEBHOOK_SECRET"}
+```
 
 ## Reglas obligatorias
 

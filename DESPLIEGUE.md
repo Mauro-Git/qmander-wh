@@ -439,6 +439,7 @@ Después de cada paso, verifica en https://ct.pepperstone.com:
    SL/TP correctos, y que la lógica Scalper/Smart Trail se ejecute
    como se espera.
 6. Solo entonces, evaluar cuenta real.
+
 ## 11. Comandos útiles PowerShell
 
 ```powershell
@@ -465,3 +466,13 @@ Get-Content .env | ForEach-Object {
 pnpm dev     # desarrollo (hot reload)
 pnpm start   # producción
 ```
+## 12. Conulstar logs
+
+# Ver logs de hoy
+Invoke-RestMethod -Uri "https://wh.qmander.com/admin/logs" -Headers @{Authorization="Bearer TU_WEBHOOK_SECRET"}
+
+# Ver logs de una fecha específica
+Invoke-RestMethod -Uri "https://wh.qmander.com/admin/logs/2026-07-22" -Headers @{Authorization="Bearer TU_WEBHOOK_SECRET"}
+
+# Listar archivos de log disponibles
+Invoke-RestMethod -Uri "https://wh.qmander.com/admin/logs-list" -Headers @{Authorization="Bearer TU_WEBHOOK_SECRET"}
