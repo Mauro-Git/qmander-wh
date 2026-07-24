@@ -196,3 +196,5 @@ Para agregar una cuenta nueva:
 - TradingView bloquea webhooks con datos que parecen tokens/passwords en el body — el secret funciona si el JSON llega como una línea sin saltos
 - `{{timenow}}` de TradingView devuelve ISO string (2026-07-22T02:06:00Z), NO Unix timestamp — poner entre comillas en el JSON: `"time":"{{timenow}}"`
 - TradingView envía Content-Type text/plain si el JSON tiene placeholders sin comillas ({{close}}) — nuestro servidor acepta ambos
+- El contador diario de peticiones (`countTradingRequest`) solo cuenta NewOrderReq y ClosePositionReq — no consultas como Reconcile, SymbolList o SymbolById. Contar todo causaba falsos "límite alcanzado" con pocas operaciones reales
+- Cada alerta aceptada loguea el desfase en segundos entre TradingView y el servidor (`[alerta] NAS100 scalper buy — desfase: 1.2s`). Si el desfase supera 30s consistentemente, hay un problema de sincronización

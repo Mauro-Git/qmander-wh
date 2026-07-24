@@ -99,12 +99,12 @@ class CTraderAccount {
     return `[${this.name}] ${msg}`
   }
 
-  private countRequest(): void {
+  private countTradingRequest(): void {
     const today = utcDay()
     if (today !== this.dayKey) { this.dayKey = today; this.requestCount = 0 }
     this.requestCount += 1
     if (this.requestCount > globalCfg.maxDailyRequests) {
-      throw new Error(this.tag(`Límite diario de peticiones alcanzado (${globalCfg.maxDailyRequests})`))
+      throw new Error(this.tag(`Límite diario de operaciones alcanzado (${globalCfg.maxDailyRequests})`))
     }
   }
 
@@ -118,7 +118,11 @@ class CTraderAccount {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         return reject(new Error(this.tag('WebSocket no conectado')))
       }
-      this.countRequest()
+
+      // Solo contar operaciones de trading (abrir/cerrar), no consultas
+      if (payloadType === PT.NEW_ORDER_REQ || payloadType === PT.CLOSE_POSITION_REQ) {
+        this.countTradingRequest()
+      }
 
       const clientMsgId = this.nextMsgId()
       const msg: CTraderMessage = { clientMsgId, payloadType, payload }

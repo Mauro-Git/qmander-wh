@@ -269,7 +269,9 @@ app.post('/webhook/tradingview', (req: Request, res: Response) => {
     return res.status(200).send('OK')
   }
 
-  // Aceptada → responder YA, ejecutar en segundo plano
+  // Aceptada → loguear desfase y ejecutar en segundo plano
+  const desfase = (age / 1000).toFixed(1)
+  log('info', `[alerta] ${alert.ticker} ${alert.signal} ${alert.action} — desfase: ${desfase}s`)
   res.status(200).send('OK')
   queue.push({ alert, attempts: 0 })
   setImmediate(processQueue)
