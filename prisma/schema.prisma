@@ -1,0 +1,137 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// NextAuth.js (Auth.js) — modelos requeridos por @auth/prisma-adapter
+// Este repo (webhook) no los usa directamente, pero deben ser idénticos a
+// trading-dashboard/prisma/schema.prisma: ambos generan clientes contra la
+// misma base de datos compartida.
+//
+// REGLA DURA: este repo NUNCA corre `prisma migrate` ni `prisma db push`.
+// Solo `prisma generate`. trading-dashboard es la única fuente de verdad
+// del schema de la DB compartida.
+// ---------------------------------------------------------------------------
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Plataforma de trading — compartido con el dashboard (Proyecto 2)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+
+  accounts Account[]
+  sessions Session[]
+
+  brokerAccount BrokerAccount?
+  config        UserConfig?
+  trades        Trade[]
+
+  webhookToken String   @unique @default(cuid())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model BrokerAccount {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  ctraderHost     String    @default("demo.ctraderapi.com")
+  clientId        String
+  clientSecretEnc Bytes // AES-256-GCM: iv(16) || tag(16) || ciphertext — IV único por campo
+  accessTokenEnc  Bytes // AES-256-GCM: iv(16) || tag(16) || ciphertext — IV único por campo
+  refreshTokenEnc Bytes // AES-256-GCM: iv(16) || tag(16) || ciphertext — IV único por campo
+  isLive          Boolean   @default(false)
+  accountId       String // ctidTraderAccountId
+  traderLogin     Int? // número de cuenta visible para el usuario (distinto del ctidTraderAccountId interno)
+  brokerTitleShort String? // nombre del broker (ej. "Pepperstone")
+  status          String    @default("disconnected") // connected | disconnected | error
+  expiresAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UserConfig {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  allowedSymbols String[] @default([])
+  maxLots        Float    @default(0.01)
+  defaultSlPips  Float    @default(20)
+  killSwitch     Boolean  @default(false)
+  symbolMap      Json     @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Trade {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  alertId String
+  action  String // buy | sell | close
+  ticker  String
+  lots    Float?
+  price   Float
+  slPips  Float?
+  tpPips  Float?
+  status  String // queued | executed | failed | retrying
+  error   String?
+
+  sourceIp  String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([alertId])
+}
