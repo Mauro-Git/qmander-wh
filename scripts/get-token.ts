@@ -36,7 +36,7 @@ if (refreshToken) {
       client_secret: clientSecret,
     }),
   })
-  const tokens = await res.json()
+  const tokens = await res.json() as Record<string, string>
   console.log('\nRespuesta de renovación:\n', JSON.stringify(tokens, null, 2))
   if (tokens.accessToken || tokens.access_token) {
     console.log('\n→ CTRADER_ACCESS_TOKEN =', tokens.accessToken ?? tokens.access_token)
@@ -73,7 +73,7 @@ const tokenRes = await fetch('https://openapi.ctrader.com/apps/token', {
   }),
 })
 
-const tokens = await tokenRes.json()
+const tokens = await tokenRes.json() as Record<string, string>
 console.log('\nRespuesta del token endpoint:\n', JSON.stringify(tokens, null, 2))
 
 if (tokens.accessToken || tokens.access_token) {

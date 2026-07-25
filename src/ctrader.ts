@@ -1,14 +1,14 @@
 /**
- * Cliente ligero cTrader Open API — WebSocket + JSON — Multi-cuenta
+ * Cliente ligero cTrader Open API — WebSocket + JSON — Multi-tenant
  * ------------------------------------------------------------------
- * Cada cuenta tiene su propia conexión WebSocket al puerto 5036.
- * Todas comparten el mismo clientId/clientSecret (app de Spotware).
+ * Una instancia de CTraderAccount por usuario (BrokerAccount es 1:1 con User).
+ * Esta clase es agnóstica de la base de datos: recibe su configuración por
+ * constructor. La lectura de BrokerAccount/UserConfig, el desencriptado de
+ * tokens y la renovación OAuth viven en accountPool.ts.
  *
- * Configuración en .env:
- *   CTRADER_HOST=demo.ctraderapi.com
- *   CTRADER_CLIENT_ID=xxx
- *   CTRADER_CLIENT_SECRET=yyy
- *   CTRADER_ACCOUNTS=[{"name":"Demo 1","accessToken":"...","accountId":47603328},{"name":"Demo 2","accessToken":"...","accountId":48123456}]
+ * clientId/clientSecret de la app Spotware son globales (misma app para
+ * todos los usuarios). host, accessToken, accountId y symbolMap son por
+ * usuario (vienen de BrokerAccount.ctraderHost / UserConfig.symbolMap).
  */
 
 import WebSocket from 'ws'
@@ -36,6 +36,9 @@ const PT = {
 const ORDER_TYPE_MARKET = 1
 const TRADE_SIDE = { buy: 1, sell: 2 } as const
 
+// ProtoOAExecutionType — solo el valor que nos interesa para detectar cierres reales.
+const EXECUTION_TYPE_ORDER_FILLED = 3
+
 // ── Tipos ────────────────────────────────────────────────────
 interface CTraderMessage {
   clientMsgId?: string
@@ -49,17 +52,23 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>
 }
 
-type SymbolDetails = { symbolId: number; lotSize: number; pipPosition: number }
+export type SymbolDetails = { symbolId: number; lotSize: number; pipPosition: number }
 
-interface AccountConfig {
+export interface AccountConfig {
+  userId: string
   name: string
+  host: string
   accessToken: string
   accountId: number
+  symbolMap?: Record<string, string>
+  /** Notifica desconexiones inesperadas del WebSocket (no llamadas a close()). */
+  onDisconnect?: () => void
+  /** Se dispara con el P&L neto real de cada cierre de posición (ExecutionEvent + closePositionDetail). */
+  onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => void
 }
 
-// ── Configuración global (compartida por todas las cuentas) ──
-const globalCfg = {
-  host:         required('CTRADER_HOST'),
+// ── Configuración global (app Spotware, compartida por todos) ──
+const appCfg = {
   clientId:     required('CTRADER_CLIENT_ID'),
   clientSecret: required('CTRADER_CLIENT_SECRET'),
   maxDailyRequests: Number(process.env.MAX_DAILY_REQUESTS ?? 1500),
@@ -73,14 +82,48 @@ function required(name: string): string {
 
 function utcDay(): string { return new Date().toISOString().slice(0, 10) }
 
-// ── Clase CTraderAccount — una instancia por cuenta ──────────
+// ── Conversiones numéricas puras (testeadas sin WebSocket) ───
 
-class CTraderAccount {
+export function volumeFromLots(lots: number, lotSize: number): number {
+  return Math.round(lots * lotSize)
+}
+
+/**
+ * Los montos monetarios de cTrader (grossProfit, swap, commission, balance)
+ * vienen como int64 escalados — dividir por 10^moneyDigits para el valor real.
+ * Verificado contra ProtoOAClosePositionDetail en el .proto fuente de Spotware.
+ */
+export function scaleMoney(raw: number, moneyDigits: number): number {
+  return raw / Math.pow(10, moneyDigits)
+}
+
+/**
+ * P&L neto de un cierre de posición. `commission` ya viene con signo negativo
+ * (es un costo) en la API, así que sumar (no restar) da el neto correcto.
+ */
+export function computeNetPnl(cpd: { grossProfit: number; swap: number; commission: number; moneyDigits: number }): number {
+  return scaleMoney(cpd.grossProfit, cpd.moneyDigits) + scaleMoney(cpd.swap, cpd.moneyDigits) + scaleMoney(cpd.commission, cpd.moneyDigits)
+}
+
+export function relativeFromPips(pips: number, pipPosition: number): number {
+  const pipFactor = Math.pow(10, 5 - pipPosition)
+  return Math.round(pips * pipFactor)
+}
+
+// ── Clase CTraderAccount — una instancia por usuario ─────────
+
+export class CTraderAccount {
+  userId: string
   name: string
+  host: string
   accountId: number
   accessToken: string
   connected = false
 
+  private symbolMap: Record<string, string>
+  private onDisconnect?: () => void
+  private onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => void
+  private closedByUs = false
   private ws: WebSocket | null = null
   private msgCounter = 0
   private pending = new Map<string, PendingRequest>()
@@ -90,9 +133,14 @@ class CTraderAccount {
   private requestCount = 0
 
   constructor(config: AccountConfig) {
+    this.userId = config.userId
     this.name = config.name
+    this.host = config.host
     this.accountId = config.accountId
     this.accessToken = config.accessToken
+    this.symbolMap = config.symbolMap ?? {}
+    this.onDisconnect = config.onDisconnect
+    this.onPositionClosed = config.onPositionClosed
   }
 
   private tag(msg: string): string {
@@ -103,8 +151,8 @@ class CTraderAccount {
     const today = utcDay()
     if (today !== this.dayKey) { this.dayKey = today; this.requestCount = 0 }
     this.requestCount += 1
-    if (this.requestCount > globalCfg.maxDailyRequests) {
-      throw new Error(this.tag(`Límite diario de operaciones alcanzado (${globalCfg.maxDailyRequests})`))
+    if (this.requestCount > appCfg.maxDailyRequests) {
+      throw new Error(this.tag(`Límite diario de operaciones alcanzado (${appCfg.maxDailyRequests})`))
     }
   }
 
@@ -150,6 +198,23 @@ class CTraderAccount {
       const o = msg.payload.order as Record<string, unknown> | undefined
       const p = msg.payload.position as Record<string, unknown> | undefined
       console.log(this.tag(`[exec] type=${msg.payload.executionType} order=${o?.orderId ?? '-'} pos=${p?.positionId ?? '-'}`))
+
+      const executionType = Number(msg.payload.executionType)
+      const deal = msg.payload.deal as Record<string, unknown> | undefined
+      const cpd = deal?.closePositionDetail as Record<string, unknown> | undefined
+      if (executionType === EXECUTION_TYPE_ORDER_FILLED && cpd) {
+        const moneyDigits = cpd.moneyDigits !== undefined ? Number(cpd.moneyDigits)
+          : deal?.moneyDigits !== undefined ? Number(deal.moneyDigits) : undefined
+        if (moneyDigits === undefined) {
+          console.error(this.tag('[dailyPnl] closePositionDetail sin moneyDigits — no se puede escalar el P&L, evento descartado'))
+        } else {
+          const netPnl = computeNetPnl({
+            grossProfit: Number(cpd.grossProfit), swap: Number(cpd.swap), commission: Number(cpd.commission), moneyDigits,
+          })
+          const balanceAfterClose = scaleMoney(Number(cpd.balance), moneyDigits)
+          this.onPositionClosed?.({ netPnl, balanceAfterClose })
+        }
+      }
     }
 
     if (msg.payloadType === PT.ORDER_ERROR_EVENT) {
@@ -174,7 +239,7 @@ class CTraderAccount {
   }
 
   async connect(): Promise<void> {
-    const url = `wss://${globalCfg.host}:5036`
+    const url = `wss://${this.host}:5036`
 
     await new Promise<void>((resolve, reject) => {
       this.ws = new WebSocket(url)
@@ -183,6 +248,7 @@ class CTraderAccount {
       this.ws.on('close', () => {
         this.connected = false
         console.error(this.tag('WebSocket cerrado'))
+        if (!this.closedByUs) this.onDisconnect?.()
       })
       this.ws.on('message', (data) => this.handleMessage(data.toString()))
     })
@@ -194,8 +260,8 @@ class CTraderAccount {
     }, 10_000)
 
     await this.send(PT.APP_AUTH_REQ, {
-      clientId: globalCfg.clientId,
-      clientSecret: globalCfg.clientSecret,
+      clientId: appCfg.clientId,
+      clientSecret: appCfg.clientSecret,
     })
 
     await this.send(PT.ACCOUNT_AUTH_REQ, {
@@ -207,6 +273,23 @@ class CTraderAccount {
     await this.loadSymbols()
 
     console.log(this.tag(`Conectado a ${url} cuenta ${this.accountId} (${this.symbolIdByName.size} símbolos)`))
+  }
+
+  close(): void {
+    this.closedByUs = true
+    this.ws?.close()
+    this.connected = false
+  }
+
+  /**
+   * UserConfig.symbolMap puede cambiar en el dashboard después de que esta
+   * cuenta ya está conectada (a diferencia de allowedSymbols/maxLots/
+   * killSwitch, que server.ts relee frescos de la DB en cada alerta). El
+   * caller debe pasar el symbolMap vigente antes de resolver un símbolo para
+   * que los cambios se reflejen sin tener que reconectar.
+   */
+  setSymbolMap(symbolMap: Record<string, string>): void {
+    this.symbolMap = symbolMap ?? {}
   }
 
   private async loadSymbols(): Promise<void> {
@@ -237,8 +320,7 @@ class CTraderAccount {
   }
 
   resolveSymbolId(ticker: string): number {
-    const map: Record<string, string> = JSON.parse(process.env.SYMBOL_MAP ?? '{}')
-    const name = (map[ticker.toUpperCase()] ?? ticker).toUpperCase()
+    const name = (this.symbolMap[ticker.toUpperCase()] ?? ticker).toUpperCase()
     const id = this.symbolIdByName.get(name)
     if (!id) throw new Error(this.tag(`Símbolo no encontrado: ${ticker}`))
     return id
@@ -252,12 +334,11 @@ class CTraderAccount {
 
     const symbolId = this.resolveSymbolId(params.ticker)
     const det = await this.getSymbolDetails(symbolId)
-    const volume = Math.round(params.lots * det.lotSize)
-    const pipFactor = Math.pow(10, 5 - det.pipPosition)
+    const volume = volumeFromLots(params.lots, det.lotSize)
     const relativeStopLoss = params.slPips && params.slPips > 0
-      ? Math.round(params.slPips * pipFactor) : undefined
+      ? relativeFromPips(params.slPips, det.pipPosition) : undefined
     const relativeTakeProfit = params.tpPips && params.tpPips > 0
-      ? Math.round(params.tpPips * pipFactor) : undefined
+      ? relativeFromPips(params.tpPips, det.pipPosition) : undefined
 
     const payload: Record<string, unknown> = {
       ctidTraderAccountId: this.accountId, symbolId,
@@ -278,6 +359,27 @@ class CTraderAccount {
       const td = p.tradeData as Record<string, unknown> | undefined
       return Number(td?.symbolId) === symbolId
     })
+    let closed = 0
+    for (const p of positions) {
+      const td = p.tradeData as Record<string, unknown>
+      try {
+        await this.send(PT.CLOSE_POSITION_REQ, {
+          ctidTraderAccountId: this.accountId,
+          positionId: Number(p.positionId), volume: Number(td.volume),
+        })
+        closed += 1
+      } catch (err) {
+        console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
+      }
+    }
+    return closed
+  }
+
+  /** Cierra TODAS las posiciones abiertas de la cuenta, sin filtrar por símbolo. Usado por dailyPnlGuard al cruzar el límite diario. */
+  async closeAllPositions(): Promise<number> {
+    if (!this.connected) throw new Error(this.tag('Sin conexión'))
+    const rec = await this.send(PT.RECONCILE_REQ, { ctidTraderAccountId: this.accountId })
+    const positions = (rec.payload.position as Array<Record<string, unknown>>) ?? []
     let closed = 0
     for (const p of positions) {
       const td = p.tradeData as Record<string, unknown>
@@ -343,114 +445,8 @@ class CTraderAccount {
 
   status() {
     return {
-      name: this.name, accountId: this.accountId, connected: this.connected,
+      userId: this.userId, name: this.name, accountId: this.accountId, connected: this.connected,
       symbols: this.symbolIdByName.size, requestsToday: this.requestCount, dayKey: this.dayKey,
     }
   }
-}
-
-// ── Pool de cuentas ──────────────────────────────────────────
-
-const accounts: CTraderAccount[] = []
-
-export async function initAllAccounts(): Promise<void> {
-  const raw = process.env.CTRADER_ACCOUNTS
-  if (!raw) {
-    console.error('FATAL: CTRADER_ACCOUNTS no definida en .env')
-    process.exit(1)
-  }
-  let configs: AccountConfig[]
-  try { configs = JSON.parse(raw) } catch {
-    console.error('FATAL: CTRADER_ACCOUNTS no es JSON válido')
-    process.exit(1)
-  }
-  if (configs.length === 0) {
-    console.error('FATAL: CTRADER_ACCOUNTS está vacío')
-    process.exit(1)
-  }
-
-  for (const cfg of configs) {
-    const account = new CTraderAccount(cfg)
-    try {
-      await account.connect()
-      accounts.push(account)
-    } catch (err) {
-      console.error(`[${cfg.name}] Error al conectar: ${(err as Error).message}`)
-    }
-  }
-
-  if (accounts.length === 0) {
-    console.error('FATAL: ninguna cuenta se pudo conectar')
-    process.exit(1)
-  }
-
-  console.log(`[pool] ${accounts.length} de ${configs.length} cuentas conectadas`)
-}
-
-// ── Funciones que ejecutan en TODAS las cuentas ──────────────
-
-export async function marketOrderAll(params: {
-  ticker: string; side: 'buy' | 'sell'; lots: number;
-  slPips?: number; tpPips?: number; label?: string
-}): Promise<void> {
-  const results = await Promise.allSettled(
-    accounts.map(a => a.marketOrder(params))
-  )
-  for (let i = 0; i < results.length; i++) {
-    if (results[i].status === 'rejected') {
-      console.error(`[${accounts[i].name}] Error en marketOrder: ${(results[i] as PromiseRejectedResult).reason}`)
-    }
-  }
-}
-
-export async function closeByLabelAll(ticker: string, labelPrefix: string): Promise<number> {
-  let total = 0
-  for (const account of accounts) {
-    try {
-      const closed = await account.closeByLabel(ticker, labelPrefix)
-      total += closed
-      if (closed > 0) console.log(`[${account.name}] ${closed} posiciones cerradas (${labelPrefix})`)
-    } catch (err) {
-      console.error(`[${account.name}] Error en closeByLabel: ${(err as Error).message}`)
-    }
-  }
-  return total
-}
-
-export async function closeAllAll(ticker: string): Promise<number> {
-  let total = 0
-  for (const account of accounts) {
-    try {
-      const closed = await account.closeAll(ticker)
-      total += closed
-    } catch (err) {
-      console.error(`[${account.name}] Error en closeAll: ${(err as Error).message}`)
-    }
-  }
-  return total
-}
-
-export async function getOpenPositionsAll(): Promise<Array<{
-  accountName: string; positionId: number; symbolId: number;
-  symbolName: string; label: string; volume: number; tradeSide: number
-}>> {
-  const all: Array<{
-    accountName: string; positionId: number; symbolId: number;
-    symbolName: string; label: string; volume: number; tradeSide: number
-  }> = []
-  for (const account of accounts) {
-    try {
-      const positions = await account.getOpenPositions()
-      for (const p of positions) {
-        all.push({ accountName: account.name, ...p })
-      }
-    } catch (err) {
-      console.error(`[${account.name}] Error al leer posiciones: ${(err as Error).message}`)
-    }
-  }
-  return all
-}
-
-export function allAccountsStatus() {
-  return accounts.map(a => a.status())
 }
