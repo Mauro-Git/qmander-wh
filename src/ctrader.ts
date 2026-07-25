@@ -36,6 +36,9 @@ const PT = {
 const ORDER_TYPE_MARKET = 1
 const TRADE_SIDE = { buy: 1, sell: 2 } as const
 
+// ProtoOAExecutionType — solo el valor que nos interesa para detectar cierres reales.
+const EXECUTION_TYPE_ORDER_FILLED = 3
+
 // ── Tipos ────────────────────────────────────────────────────
 interface CTraderMessage {
   clientMsgId?: string
@@ -60,6 +63,8 @@ export interface AccountConfig {
   symbolMap?: Record<string, string>
   /** Notifica desconexiones inesperadas del WebSocket (no llamadas a close()). */
   onDisconnect?: () => void
+  /** Se dispara con el P&L neto real de cada cierre de posición (ExecutionEvent + closePositionDetail). */
+  onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => void
 }
 
 // ── Configuración global (app Spotware, compartida por todos) ──
@@ -83,6 +88,23 @@ export function volumeFromLots(lots: number, lotSize: number): number {
   return Math.round(lots * lotSize)
 }
 
+/**
+ * Los montos monetarios de cTrader (grossProfit, swap, commission, balance)
+ * vienen como int64 escalados — dividir por 10^moneyDigits para el valor real.
+ * Verificado contra ProtoOAClosePositionDetail en el .proto fuente de Spotware.
+ */
+export function scaleMoney(raw: number, moneyDigits: number): number {
+  return raw / Math.pow(10, moneyDigits)
+}
+
+/**
+ * P&L neto de un cierre de posición. `commission` ya viene con signo negativo
+ * (es un costo) en la API, así que sumar (no restar) da el neto correcto.
+ */
+export function computeNetPnl(cpd: { grossProfit: number; swap: number; commission: number; moneyDigits: number }): number {
+  return scaleMoney(cpd.grossProfit, cpd.moneyDigits) + scaleMoney(cpd.swap, cpd.moneyDigits) + scaleMoney(cpd.commission, cpd.moneyDigits)
+}
+
 export function relativeFromPips(pips: number, pipPosition: number): number {
   const pipFactor = Math.pow(10, 5 - pipPosition)
   return Math.round(pips * pipFactor)
@@ -100,6 +122,7 @@ export class CTraderAccount {
 
   private symbolMap: Record<string, string>
   private onDisconnect?: () => void
+  private onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => void
   private closedByUs = false
   private ws: WebSocket | null = null
   private msgCounter = 0
@@ -117,6 +140,7 @@ export class CTraderAccount {
     this.accessToken = config.accessToken
     this.symbolMap = config.symbolMap ?? {}
     this.onDisconnect = config.onDisconnect
+    this.onPositionClosed = config.onPositionClosed
   }
 
   private tag(msg: string): string {
@@ -174,6 +198,23 @@ export class CTraderAccount {
       const o = msg.payload.order as Record<string, unknown> | undefined
       const p = msg.payload.position as Record<string, unknown> | undefined
       console.log(this.tag(`[exec] type=${msg.payload.executionType} order=${o?.orderId ?? '-'} pos=${p?.positionId ?? '-'}`))
+
+      const executionType = Number(msg.payload.executionType)
+      const deal = msg.payload.deal as Record<string, unknown> | undefined
+      const cpd = deal?.closePositionDetail as Record<string, unknown> | undefined
+      if (executionType === EXECUTION_TYPE_ORDER_FILLED && cpd) {
+        const moneyDigits = cpd.moneyDigits !== undefined ? Number(cpd.moneyDigits)
+          : deal?.moneyDigits !== undefined ? Number(deal.moneyDigits) : undefined
+        if (moneyDigits === undefined) {
+          console.error(this.tag('[dailyPnl] closePositionDetail sin moneyDigits — no se puede escalar el P&L, evento descartado'))
+        } else {
+          const netPnl = computeNetPnl({
+            grossProfit: Number(cpd.grossProfit), swap: Number(cpd.swap), commission: Number(cpd.commission), moneyDigits,
+          })
+          const balanceAfterClose = scaleMoney(Number(cpd.balance), moneyDigits)
+          this.onPositionClosed?.({ netPnl, balanceAfterClose })
+        }
+      }
     }
 
     if (msg.payloadType === PT.ORDER_ERROR_EVENT) {
@@ -318,6 +359,27 @@ export class CTraderAccount {
       const td = p.tradeData as Record<string, unknown> | undefined
       return Number(td?.symbolId) === symbolId
     })
+    let closed = 0
+    for (const p of positions) {
+      const td = p.tradeData as Record<string, unknown>
+      try {
+        await this.send(PT.CLOSE_POSITION_REQ, {
+          ctidTraderAccountId: this.accountId,
+          positionId: Number(p.positionId), volume: Number(td.volume),
+        })
+        closed += 1
+      } catch (err) {
+        console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
+      }
+    }
+    return closed
+  }
+
+  /** Cierra TODAS las posiciones abiertas de la cuenta, sin filtrar por símbolo. Usado por dailyPnlGuard al cruzar el límite diario. */
+  async closeAllPositions(): Promise<number> {
+    if (!this.connected) throw new Error(this.tag('Sin conexión'))
+    const rec = await this.send(PT.RECONCILE_REQ, { ctidTraderAccountId: this.accountId })
+    const positions = (rec.payload.position as Array<Record<string, unknown>>) ?? []
     let closed = 0
     for (const p of positions) {
       const td = p.tradeData as Record<string, unknown>

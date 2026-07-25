@@ -13,6 +13,7 @@ import { prisma } from './lib/prisma.js'
 import { decryptField, encryptField } from './lib/crypto.js'
 import { refreshAccessToken } from './lib/ctrader-oauth.js'
 import { CTraderAccount } from './ctrader.js'
+import { recordRealizedPnl } from './dailyPnlGuard.js'
 
 // Renovar si faltan menos de 48h para el vencimiento (~30 días de vida total).
 const REFRESH_MARGIN_MS = 48 * 60 * 60 * 1000
@@ -62,6 +63,11 @@ async function connectAccount(broker: BrokerAccountWithConfig, onAccountReady?: 
       onDisconnect: () => {
         pool.delete(broker.userId)
         prisma.brokerAccount.update({ where: { id: broker.id }, data: { status: 'disconnected' } }).catch(() => {})
+      },
+      onPositionClosed: (info) => {
+        recordRealizedPnl(account, info).catch((err) => {
+          console.error(`[accountPool] Error en recordRealizedPnl para ${broker.userId}: ${(err as Error).message}`)
+        })
       },
     })
 

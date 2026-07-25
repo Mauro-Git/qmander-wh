@@ -14,7 +14,9 @@ En producción (`main`, rama desplegada): single-tenant, `CTRADER_ACCOUNTS` est�
 En desarrollo (rama `feature/multi-tenant`, NO desplegada todavía): migración a
 multi-tenant completa. El webhook ahora lee todo de PostgreSQL (Prisma) en vez de env
 vars estáticas — ver "Arquitectura — Dos proyectos separados" y "Multi-tenant (DB)" más
-abajo. Pendiente: verificación end-to-end contra demo antes de mergear a `main`.
+abajo. Sobre esta misma rama se agregó además el enforcement de límites diarios de
+ganancia/pérdida (ver "Límites diarios de ganancia/pérdida" más abajo). Pendiente:
+verificación end-to-end contra demo antes de mergear a `main`.
 
 - **URL live (main)**: https://wh.qmander.com/ (también https://qmander-tradingview-bridge-tradingview-bridge.pommed.easypanel.host/)
 - **Funcionalidad probada**: Scalper buy/sell, Smart Trail buy/sell, Exit, Close All en NAS100
@@ -260,6 +262,50 @@ Para agregar un usuario nuevo: se hace 100% desde `trading-dashboard` (login Goo
 wizard OAuth cTrader + configuración de riesgo). El webhook lo recoge solo — conecta la
 cuenta eager al arrancar, o a demanda (fallback perezoso) si se vinculó después del boot.
 
+## Límites diarios de ganancia/pérdida
+
+`UserConfig` tiene `dailyProfitTarget`/`dailyProfitTargetType` y
+`dailyLossLimit`/`dailyLossLimitType` (`"percent"` del balance al arrancar el día, o
+`"fixed"` en USD) — se configuran desde el dashboard (`/config`). El **enforcement**
+(cerrar todo + activar `killSwitch`) vive acá, porque el webhook es quien recibe el P&L
+realizado real de cTrader.
+
+**Fuente del P&L: el resultado real de cTrader, nunca una estimación** a partir del
+precio de la alerta de TradingView (ignora slippage/comisión/swap). Se lee de
+`ProtoOAExecutionEvent` (payloadType 2126) → `deal.closePositionDetail`, presente solo
+cuando `executionType === 3` (`ORDER_FILLED`) y el fill cierra una posición. Campos
+verificados contra el `.proto` fuente de Spotware (`github.com/spotware/openapi-proto-messages`,
+no la doc renderizada de help.ctrader.com, que estaba incompleta):
+
+- `grossProfit`, `swap`, `commission`, `balance` — todos `int64` escalados, dividir por
+  `10^moneyDigits` (en `closePositionDetail.moneyDigits`, con fallback a `deal.moneyDigits`).
+  Si ninguno está presente, no adivinar el factor — descartar el evento con un error.
+- `commission` ya viene con signo negativo (es un costo).
+- **Net P&L de un cierre = `(grossProfit + swap + commission) / 10^moneyDigits`**
+  (`ctrader.ts` → `computeNetPnl`/`scaleMoney`).
+- `balance` es el balance de la cuenta **después** de liquidar ese cierre — de ahí se
+  deriva `startBalance` del día en el primer cierre (`balance − netPnl`), sin pedir un
+  balance aparte.
+
+Estado persistido en `DailyPnlState` (a diferencia de `scalperState`, que vive solo en
+memoria y se reconstruye al reiniciar — acá conviene sobrevivir un restart sin
+reconstrucción). Corte de día: **medianoche UTC**, mismo criterio que `utcDay()`. Si el
+usuario reactiva `killSwitch=false` a mano antes de que termine el día UTC, el límite
+**no** puede volver a dispararse ese mismo día — `triggered` queda en `true` hasta el
+día siguiente.
+
+Flujo (`src/dailyPnlGuard.ts`): `recordRealizedPnl()` hace un `upsert` con `increment`
+atómico de `realizedPnl` (evita perder incrementos si llegan varios cierres casi
+simultáneos — el propio cierre-de-todo de este mecanismo genera varios
+`EXECUTION_EVENT` en cascada). Antes de cerrar todo + activar `killSwitch`, hace un
+`updateMany({ where: { triggered: false } })` como compare-and-set atómico — solo el
+evento que gana esa carrera dispara el cierre; el resto ve `count === 0` y no hace nada.
+Si `closeAllPositions()` falla igual se activa `killSwitch` (más vale con cierre
+parcial que sin freno). Al disparar, limpia también el `scalperState` en memoria del
+usuario (`onDailyLimitClearState`, registrado una vez desde `server.ts` — evita import
+circular server.ts↔accountPool.ts↔ctrader.ts) para que el motor de señales no crea que
+sigue habiendo una posición abierta que en realidad se cerró por este mecanismo.
+
 ## Aprendizajes clave (no repetir estos errores)
 
 - `@reiryoku/ctrader-layer` tiene vulnerabilidades irresolubles en protobufjs y axios — NO reintroducir
@@ -288,3 +334,5 @@ cuenta eager al arrancar, o a demanda (fallback perezoso) si se vinculó despué
 - `UserConfig.symbolMap` (a diferencia de `allowedSymbols`/`maxLots`/`killSwitch`, que se releen frescos de la DB en cada alerta) se capturaba una sola vez en `CTraderAccount` al conectar — si el usuario cambiaba el mapeo en el dashboard después, el webhook seguía usando el mapeo viejo hasta reconectar. Se arregló con `CTraderAccount.setSymbolMap()`, llamado en cada `processSignal` con el valor vigente de `UserConfig.symbolMap` (viaja en el `Job` de la cola)
 - Verificado contra demo: la cuenta de Mauro usa `"US TECH 100"` como nombre de símbolo para el índice, NO `"NAS100"` — cada broker/cuenta puede nombrar los símbolos distinto, por eso `symbolMap` es obligatorio configurar por usuario si el ticker de TradingView no coincide literalmente con el nombre en cTrader
 - El error `MARKET_CLOSED` de cTrader es una respuesta de negocio legítima (mercado cerrado fuera de horario), no un bug — se propaga igual que cualquier otro error de la API a través del pipeline de reintentos y auditoría en `Trade`
+- La doc renderizada de help.ctrader.com/open-api/messages/ está incompleta (no lista todos los campos de `ProtoOADeal`/`ProtoOAClosePositionDetail`/`ProtoOAExecutionEvent`). El `.proto` fuente en `github.com/spotware/openapi-proto-messages` (`OpenApiMessages.proto`, `OpenApiModelMessages.proto`) es la fuente de verdad real — consultarlo directo cuando se necesite el nombre exacto de un campo, no asumir ni confiar solo en la doc renderizada
+- `ProtoOAExecutionEvent` trae `order`, `position` Y `deal` (este último no se leía hasta agregar el enforcement de límites diarios) — `deal.closePositionDetail` solo está presente cuando el fill efectivamente cierra una posición, no en fills que abren

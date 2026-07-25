@@ -69,9 +69,10 @@ model User {
   accounts Account[]
   sessions Session[]
 
-  brokerAccount BrokerAccount?
-  config        UserConfig?
-  trades        Trade[]
+  brokerAccount  BrokerAccount?
+  config         UserConfig?
+  trades         Trade[]
+  dailyPnlStates DailyPnlState[]
 
   webhookToken String   @unique @default(cuid())
   createdAt    DateTime @default(now())
@@ -110,6 +111,12 @@ model UserConfig {
   killSwitch     Boolean  @default(false)
   symbolMap      Json     @default("{}")
 
+  // Límites diarios — si se alcanzan, cierra todo y activa killSwitch (enforcement en traderWebHook)
+  dailyProfitTarget     Float?
+  dailyProfitTargetType String @default("percent") // "percent" (del balance al arrancar el día) | "fixed" (USD)
+  dailyLossLimit        Float?
+  dailyLossLimitType    String @default("percent")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -134,4 +141,22 @@ model Trade {
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([alertId])
+}
+
+// Estado del enforcement de límites diarios de ganancia/pérdida (traderWebHook).
+// Se persiste directo (a diferencia del scalperState en memoria) para sobrevivir un reinicio.
+model DailyPnlState {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  day          DateTime // medianoche UTC del día de trading al que pertenece
+  startBalance Float? // balance/equity capturado en el primer evento del día
+  realizedPnl  Float    @default(0) // acumulado de P&L realizado, sumado en cada cierre
+  triggered    Boolean  @default(false) // evita disparar el cierre+killSwitch más de una vez por día
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, day])
 }

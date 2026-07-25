@@ -21,6 +21,7 @@ import { join } from 'node:path'
 import { z } from 'zod'
 import { prisma } from './lib/prisma.js'
 import { initAllAccounts, getAccountForUser, allPoolStatus } from './accountPool.js'
+import { onDailyLimitClearState } from './dailyPnlGuard.js'
 import type { CTraderAccount } from './ctrader.js'
 
 // ── Configuración ────────────────────────────────────────────
@@ -62,6 +63,18 @@ const scalperState = new Map<string, ScalperState>()
 export function stateKey(userId: string, ticker: string): string {
   return `${userId}:${ticker.toUpperCase()}`
 }
+
+// Si dailyPnlGuard cierra todo por límite diario, el motor de señales en
+// memoria no debe seguir pensando que hay un scalper/smart trail abierto para
+// ese usuario — si no, al reactivar killSwitch más tarde podría ignorar una
+// nueva señal "scalper" creyendo que ya hay una posición cuando en realidad
+// se cerró por este mecanismo.
+onDailyLimitClearState((userId) => {
+  const prefix = `${userId}:`
+  for (const key of scalperState.keys()) {
+    if (key.startsWith(prefix)) scalperState.delete(key)
+  }
+})
 
 // ── Esquema del payload ──────────────────────────────────────
 
