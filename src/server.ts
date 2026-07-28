@@ -22,6 +22,7 @@ import { z } from 'zod'
 import { prisma } from './lib/prisma.js'
 import { initAllAccounts, getAccountForUser, allPoolStatus } from './accountPool.js'
 import { onDailyLimitClearState } from './dailyPnlGuard.js'
+import { replicateToFollowers } from './mirrorTrading.js'
 import type { CTraderAccount } from './ctrader.js'
 
 // ── Configuración ────────────────────────────────────────────
@@ -159,7 +160,7 @@ async function rebuildStateForAccount(account: CTraderAccount): Promise<void> {
 
 // ── Motor de reglas Scalper / Smart Trail / Exit ─────────────
 
-async function processSignal(alert: Alert, userId: string, symbolMap: Record<string, string>): Promise<void> {
+export async function processSignal(alert: Alert, userId: string, symbolMap: Record<string, string>): Promise<void> {
   const account = await getAccountForUser(userId, rebuildStateForAccount)
   if (!account) throw new Error('No se pudo conectar la cuenta cTrader del usuario')
   account.setSymbolMap(symbolMap)
@@ -373,6 +374,11 @@ app.post('/webhook/tradingview', async (req: Request, res: Response) => {
   res.status(200).send('OK')
   queue.push({ alert, userId: user.id, tradeId: trade.id, symbolMap: user.config.symbolMap as Record<string, string>, attempts: 0 })
   setImmediate(processQueue)
+
+  // Copy trading: replicar en cuentas vinculadas (AccountLink status "accepted").
+  // No bloquea la respuesta ni la ejecución del maestro — ver mirrorTrading.ts.
+  replicateToFollowers(alert, user.id, { checkRisk, processSignal, isDuplicate, superadminKillSwitch, log })
+    .catch((err) => log('error', `[mirror] Error inesperado replicando alerta de ${user.id}: ${(err as Error).message}`))
 })
 
 // Estado de todas las cuentas conectadas

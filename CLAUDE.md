@@ -135,6 +135,7 @@ base de datos PostgreSQL:
 5. ✅ Credenciales del broker desencriptadas con AES-256-GCM (`src/lib/crypto.ts`, mismo `ENCRYPTION_KEY` que el dashboard)
 6. ⏳ Verificación end-to-end contra cTrader demo antes de mergear a `main`
 7. ⏳ Deploy a EasyPanel (requiere agregar `DATABASE_URL`/`ENCRYPTION_KEY`/`ADMIN_SECRET` a las env vars del servicio)
+8. ✅ Copy trading: replicar operaciones en cuentas vinculadas (`AccountLink`, ver "Copy trading" más abajo)
 
 ### Fase 1B — Frontend básico (Proyecto 2)
 1. Crear proyecto Next.js 15 con NextAuth.js + Google
@@ -305,6 +306,48 @@ parcial que sin freno). Al disparar, limpia también el `scalperState` en memori
 usuario (`onDailyLimitClearState`, registrado una vez desde `server.ts` — evita import
 circular server.ts↔accountPool.ts↔ctrader.ts) para que el motor de señales no crea que
 sigue habiendo una posición abierta que en realidad se cerró por este mecanismo.
+
+## Copy trading — replicar operaciones en cuentas vinculadas
+
+`AccountLink` (`masterUserId`, `followerUserId`, `status: pending|accepted|rejected|revoked`)
+vive en el schema compartido. Uno-a-muchos: un maestro puede tener varios vinculados
+activos (`status = "accepted"`, aceptado desde `/links` en el dashboard). La vinculación
+en sí (invitar, aceptar, revocar) se gestiona 100% desde `trading-dashboard` — el webhook
+solo lee `status = "accepted"` y replica.
+
+Flujo (`src/mirrorTrading.ts`, invocado desde `server.ts` justo después de encolar el job
+del maestro en `/webhook/tradingview`): se ejecuta la alerta normalmente para el maestro
+(ya la validaron las 5 capas de seguridad con SU riesgo), y recién ahí se buscan sus
+`AccountLink` aceptados. Por cada vinculado:
+
+- Se evalúa el riesgo con la config del **vinculado**, nunca la del maestro — `checkRisk`
+  (la misma función pura que usa el maestro) con `UserConfig` del vinculado. Esto incluye
+  su propio `killSwitch`: igual que hoy `checkRisk` no distingue por tipo de acción, un
+  `killSwitch` del vinculado bloquea también los cierres replicados, por consistencia.
+- Lotes = `Math.min(alert.lots, followerConfig.maxLots)` (`buildMirrorAlert`) — nunca los
+  lotes del maestro tal cual. Símbolo resuelto con el `symbolMap` propio del vinculado
+  (mismo mecanismo que ya usa `processSignal` para cualquier usuario).
+- `alert_id` derivado como `${alert.alert_id}-mirror-${followerUserId}` — trazable y
+  deduplicado con el mismo `isDuplicate()` que ya protege contra reintentos de TradingView.
+- Cierres (`exit`/`close_all`) se replican igual que buy/sell: `processSignal` ya opera
+  sobre la cuenta y el `scalperState` del `userId` que se le pase, así que llamarlo con el
+  `userId` del vinculado cierra únicamente SUS posiciones — no hay riesgo de cruce entre
+  cuentas.
+- Si falla la réplica (cuenta desconectada, error de ejecución, etc.) se crea igual un
+  `Trade` con `userId` del vinculado y `status: "failed"` — queda visible en su propio
+  `/trades` en vez de fallar en silencio.
+- Un fallo replicando en un vinculado no afecta la ejecución ya hecha para el maestro
+  (`Promise.allSettled`, mismo patrón que las viejas funciones `*All` de fan-out). No se
+  loguea el `secret` de nadie.
+
+Si el maestro mismo es bloqueado por sus capas de seguridad (kill switch, símbolo no
+permitido, etc.) la alerta nunca llega a encolarse y por lo tanto tampoco se replica —
+"replicar la acción del maestro" presupone que el maestro efectivamente la tomó.
+
+Las dependencias del motor de señales (`processSignal`, `checkRisk`, `isDuplicate`, `log`)
+se inyectan por parámetro en `replicateToFollowers()` en vez de importarse directo de
+`server.ts`, para evitar el mismo tipo de import circular que ya resuelve
+`onDailyLimitClearState` en `dailyPnlGuard.ts`.
 
 ## Aprendizajes clave (no repetir estos errores)
 

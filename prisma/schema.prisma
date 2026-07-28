@@ -69,10 +69,12 @@ model User {
   accounts Account[]
   sessions Session[]
 
-  brokerAccount  BrokerAccount?
-  config         UserConfig?
-  trades         Trade[]
-  dailyPnlStates DailyPnlState[]
+  brokerAccount   BrokerAccount?
+  config          UserConfig?
+  trades          Trade[]
+  dailyPnlStates  DailyPnlState[]
+  linksAsMaster   AccountLink[]   @relation("LinkMaster")
+  linksAsFollower AccountLink[]   @relation("LinkFollower")
 
   webhookToken String   @unique @default(cuid())
   createdAt    DateTime @default(now())
@@ -159,4 +161,25 @@ model DailyPnlState {
   updatedAt DateTime @updatedAt
 
   @@unique([userId, day])
+}
+
+// Vínculo de copia de operaciones entre dos usuarios (enforcement en traderWebHook).
+// El maestro dispara la alerta; el vinculado la replica en su propia cuenta, respetando
+// SIEMPRE su propio riesgo (maxLots, allowedSymbols, killSwitch) — nunca hereda el del maestro.
+model AccountLink {
+  id String @id @default(cuid())
+
+  masterUserId String
+  master       User   @relation("LinkMaster", fields: [masterUserId], references: [id])
+
+  followerUserId String
+  follower       User   @relation("LinkFollower", fields: [followerUserId], references: [id])
+
+  status      String    @default("pending") // pending | accepted | rejected | revoked
+  respondedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([masterUserId, followerUserId])
 }
