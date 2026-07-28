@@ -21,7 +21,7 @@ import { join } from 'node:path'
 import { z } from 'zod'
 import { prisma } from './lib/prisma.js'
 import { initAllAccounts, getAccountForUser, allPoolStatus } from './accountPool.js'
-import { onDailyLimitClearState } from './dailyPnlGuard.js'
+import { onDailyLimitClearState, isDailyLimitTriggered } from './dailyPnlGuard.js'
 import { replicateToFollowers } from './mirrorTrading.js'
 import type { CTraderAccount } from './ctrader.js'
 
@@ -99,9 +99,17 @@ export interface UserRiskConfig {
   allowedSymbols: string[]
   maxLots: number
   killSwitch: boolean
+  // true si UserConfig.dailyProfitTarget/dailyLossLimit se cruzó hoy (DailyPnlState.triggered,
+  // ver dailyPnlGuard.ts). Distinto de killSwitch: este se resetea solo al día siguiente.
+  dailyLimitTriggered: boolean
 }
 
-export type RiskDenyReason = 'superadmin-kill-switch' | 'user-kill-switch' | 'symbol-not-allowed' | 'max-lots-exceeded'
+export type RiskDenyReason =
+  | 'superadmin-kill-switch'
+  | 'user-kill-switch'
+  | 'daily-limit-triggered'
+  | 'symbol-not-allowed'
+  | 'max-lots-exceeded'
 
 export function checkRisk(
   alert: { ticker: string; lots?: number },
@@ -110,6 +118,7 @@ export function checkRisk(
 ): { allowed: true } | { allowed: false; reason: RiskDenyReason } {
   if (superadminKillSwitch) return { allowed: false, reason: 'superadmin-kill-switch' }
   if (config.killSwitch) return { allowed: false, reason: 'user-kill-switch' }
+  if (config.dailyLimitTriggered) return { allowed: false, reason: 'daily-limit-triggered' }
   if (config.allowedSymbols.length > 0 && !config.allowedSymbols.includes(alert.ticker.toUpperCase())) {
     return { allowed: false, reason: 'symbol-not-allowed' }
   }
@@ -346,7 +355,13 @@ app.post('/webhook/tradingview', async (req: Request, res: Response) => {
   if (isDuplicate(`${user.id}:${alert.alert_id}`)) return res.status(200).send('OK')
 
   // Capa 5: riesgo
-  const risk = checkRisk(alert, user.config, superadminKillSwitch)
+  const dailyLimitTriggered = await isDailyLimitTriggered(user.id)
+  const risk = checkRisk(alert, {
+    allowedSymbols: user.config.allowedSymbols,
+    maxLots: user.config.maxLots,
+    killSwitch: user.config.killSwitch,
+    dailyLimitTriggered,
+  }, superadminKillSwitch)
   if (!risk.allowed) {
     log('warn', `Riesgo (${risk.reason}) usuario ${user.id}: ${alert.alert_id} ignorada`)
     return res.status(200).send('OK')
@@ -377,7 +392,7 @@ app.post('/webhook/tradingview', async (req: Request, res: Response) => {
 
   // Copy trading: replicar en cuentas vinculadas (AccountLink status "accepted").
   // No bloquea la respuesta ni la ejecución del maestro — ver mirrorTrading.ts.
-  replicateToFollowers(alert, user.id, { checkRisk, processSignal, isDuplicate, superadminKillSwitch, log })
+  replicateToFollowers(alert, user.id, { checkRisk, processSignal, isDuplicate, isDailyLimitTriggered, superadminKillSwitch, log })
     .catch((err) => log('error', `[mirror] Error inesperado replicando alerta de ${user.id}: ${(err as Error).message}`))
 })
 

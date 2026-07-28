@@ -5,9 +5,15 @@
  * del precio de la alerta de TradingView.
  *
  * Corte de día: medianoche UTC (mismo criterio que utcDay() en ctrader.ts).
- * Si el límite se cruza, se cierran todas las posiciones y se activa
- * UserConfig.killSwitch. Una vez disparado (`triggered`), no se vuelve a
- * evaluar ese mismo día aunque el usuario reactive killSwitch a mano.
+ * Si el límite se cruza, se cierran todas las posiciones y se marca
+ * DailyPnlState.triggered=true (junto con reason/triggeredAt, que el dashboard
+ * lee para mostrar motivo y hora). NO se toca UserConfig.killSwitch — ese campo
+ * es exclusivamente el toggle manual del usuario. La capa 5 de riesgo
+ * (checkRisk en server.ts) rechaza alertas si CUALQUIERA de los dos está
+ * activo: killSwitch manual, o DailyPnlState.triggered del día (vía
+ * isDailyLimitTriggered). Al ser una fila por día, el bloqueo automático se
+ * resetea solo al día siguiente sin depender de que el usuario reactive nada
+ * a mano.
  */
 
 import { prisma } from './lib/prisma.js'
@@ -44,6 +50,14 @@ export function checkDailyLimit(
 
 function utcMidnight(): Date {
   return new Date(new Date().toISOString().slice(0, 10))
+}
+
+/** Usado por la capa 5 de riesgo (checkRisk) — true si el límite diario ya se disparó hoy. */
+export async function isDailyLimitTriggered(userId: string): Promise<boolean> {
+  const state = await prisma.dailyPnlState.findUnique({
+    where: { userId_day: { userId, day: utcMidnight() } },
+  })
+  return state?.triggered ?? false
 }
 
 // Registro sin import circular: server.ts se registra una vez al arrancar para
@@ -83,19 +97,18 @@ export async function recordRealizedPnl(
     // Compare-and-set atómico: solo el evento que efectivamente gana la carrera dispara el cierre.
     const claimed = await prisma.dailyPnlState.updateMany({
       where: { id: state.id, triggered: false },
-      data: { triggered: true },
+      data: { triggered: true, reason: result.reason, triggeredAt: new Date() },
     })
     if (claimed.count === 0) return
 
     console.warn(
       `[dailyPnlGuard] ${account.name}: límite diario alcanzado (${result.reason}), ` +
-      `realizedPnl=${state.realizedPnl.toFixed(2)} startBalance=${startBalance.toFixed(2)} — cerrando todo y activando killSwitch`
+      `realizedPnl=${state.realizedPnl.toFixed(2)} startBalance=${startBalance.toFixed(2)} — cerrando todo y bloqueando nuevas alertas por hoy`
     )
 
     await account.closeAllPositions().catch((err) => {
       console.error(`[dailyPnlGuard] ${account.name}: error cerrando posiciones: ${(err as Error).message}`)
     })
-    await prisma.userConfig.update({ where: { userId: account.userId }, data: { killSwitch: true } })
     clearStateHook?.(account.userId)
   } catch (err) {
     console.error(`[dailyPnlGuard] Error procesando P&L de ${account.name}: ${(err as Error).message}`)

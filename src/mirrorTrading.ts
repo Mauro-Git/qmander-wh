@@ -25,6 +25,7 @@ export interface MirrorDeps {
   checkRisk: MirrorRiskCheck
   processSignal: (alert: Alert, userId: string, symbolMap: Record<string, string>) => Promise<void>
   isDuplicate: (id: string) => boolean
+  isDailyLimitTriggered: (userId: string) => Promise<boolean>
   superadminKillSwitch: boolean
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
 }
@@ -41,7 +42,7 @@ export function buildMirrorAlert(alert: Alert, followerId: string, followerMaxLo
 interface FollowerRecord {
   id: string
   brokerAccount: unknown
-  config: UserRiskConfig & { symbolMap: unknown } | null
+  config: Omit<UserRiskConfig, 'dailyLimitTriggered'> & { symbolMap: unknown } | null
 }
 
 export async function replicateToFollowers(alert: Alert, masterUserId: string, deps: MirrorDeps): Promise<void> {
@@ -67,7 +68,13 @@ async function replicateToFollower(
   const mirrorAlertId = `${alert.alert_id}-mirror-${follower.id}`
   if (deps.isDuplicate(`${follower.id}:${mirrorAlertId}`)) return
 
-  const risk = deps.checkRisk(alert, follower.config, deps.superadminKillSwitch)
+  const dailyLimitTriggered = await deps.isDailyLimitTriggered(follower.id)
+  const risk = deps.checkRisk(alert, {
+    allowedSymbols: follower.config.allowedSymbols,
+    maxLots: follower.config.maxLots,
+    killSwitch: follower.config.killSwitch,
+    dailyLimitTriggered,
+  }, deps.superadminKillSwitch)
   if (!risk.allowed) {
     deps.log('info', `[mirror] Riesgo (${risk.reason}) vinculado ${follower.id}: ${mirrorAlertId} ignorada`)
     return

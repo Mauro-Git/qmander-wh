@@ -268,8 +268,14 @@ cuenta eager al arrancar, o a demanda (fallback perezoso) si se vinculó despué
 `UserConfig` tiene `dailyProfitTarget`/`dailyProfitTargetType` y
 `dailyLossLimit`/`dailyLossLimitType` (`"percent"` del balance al arrancar el día, o
 `"fixed"` en USD) — se configuran desde el dashboard (`/config`). El **enforcement**
-(cerrar todo + activar `killSwitch`) vive acá, porque el webhook es quien recibe el P&L
-realizado real de cTrader.
+(cerrar todo + bloquear nuevas alertas por el resto del día) vive acá, porque el webhook
+es quien recibe el P&L realizado real de cTrader.
+
+**Importante: este mecanismo NUNCA toca `UserConfig.killSwitch`** — ese campo es
+exclusivamente el toggle manual que el usuario controla desde el dashboard. El límite
+diario automático se marca en su propia fila (`DailyPnlState.triggered`), separada del
+kill switch manual, precisamente para que se resetee solo al día siguiente sin depender
+de que el usuario lo reactive a mano (ver más abajo).
 
 **Fuente del P&L: el resultado real de cTrader, nunca una estimación** a partir del
 precio de la alerta de TradingView (ignora slippage/comisión/swap). Se lee de
@@ -290,22 +296,34 @@ no la doc renderizada de help.ctrader.com, que estaba incompleta):
 
 Estado persistido en `DailyPnlState` (a diferencia de `scalperState`, que vive solo en
 memoria y se reconstruye al reiniciar — acá conviene sobrevivir un restart sin
-reconstrucción). Corte de día: **medianoche UTC**, mismo criterio que `utcDay()`. Si el
-usuario reactiva `killSwitch=false` a mano antes de que termine el día UTC, el límite
-**no** puede volver a dispararse ese mismo día — `triggered` queda en `true` hasta el
-día siguiente.
+reconstrucción). Además de `realizedPnl`/`startBalance`/`triggered`, la fila guarda
+`reason` (`"profit-target"` | `"loss-limit"`) y `triggeredAt` — el dashboard los lee
+para mostrar motivo y hora de activación. Corte de día: **medianoche UTC**, mismo
+criterio que `utcDay()`. Como el bloqueo automático vive en `DailyPnlState` y no en
+`UserConfig.killSwitch`, se resetea solo — la fila del día siguiente arranca con
+`triggered: false` sin depender de que el usuario reactive nada a mano. Reactivar
+`killSwitch=false` a mano el mismo día UTC no reabilita nada: `checkRisk` (capa 5, ver
+`server.ts`) sigue rechazando alertas de ese usuario mientras `DailyPnlState.triggered`
+del día siga en `true`.
 
 Flujo (`src/dailyPnlGuard.ts`): `recordRealizedPnl()` hace un `upsert` con `increment`
 atómico de `realizedPnl` (evita perder incrementos si llegan varios cierres casi
 simultáneos — el propio cierre-de-todo de este mecanismo genera varios
-`EXECUTION_EVENT` en cascada). Antes de cerrar todo + activar `killSwitch`, hace un
-`updateMany({ where: { triggered: false } })` como compare-and-set atómico — solo el
-evento que gana esa carrera dispara el cierre; el resto ve `count === 0` y no hace nada.
-Si `closeAllPositions()` falla igual se activa `killSwitch` (más vale con cierre
-parcial que sin freno). Al disparar, limpia también el `scalperState` en memoria del
-usuario (`onDailyLimitClearState`, registrado una vez desde `server.ts` — evita import
-circular server.ts↔accountPool.ts↔ctrader.ts) para que el motor de señales no crea que
-sigue habiendo una posición abierta que en realidad se cerró por este mecanismo.
+`EXECUTION_EVENT` en cascada). Antes de cerrar todo, hace un
+`updateMany({ where: { triggered: false }, data: { triggered: true, reason, triggeredAt } })`
+como compare-and-set atómico — solo el evento que gana esa carrera dispara el cierre; el
+resto ve `count === 0` y no hace nada. Si `closeAllPositions()` falla el registro del
+trigger ya quedó hecho igual (más vale con cierre parcial que sin freno). Al disparar,
+limpia también el `scalperState` en memoria del usuario (`onDailyLimitClearState`,
+registrado una vez desde `server.ts` — evita import circular
+server.ts↔accountPool.ts↔ctrader.ts) para que el motor de señales no crea que sigue
+habiendo una posición abierta que en realidad se cerró por este mecanismo.
+
+**Capa 5 de riesgo (`checkRisk` en `server.ts`) rechaza una alerta si CUALQUIERA de dos
+condiciones independientes es verdadera**: `UserConfig.killSwitch === true` (manual) o
+`DailyPnlState` de hoy para ese usuario tiene `triggered === true` (automático, vía
+`isDailyLimitTriggered()` en `dailyPnlGuard.ts`). Copy trading (`mirrorTrading.ts`)
+evalúa esta misma condición con el `userId` del **vinculado**, nunca el del maestro.
 
 ## Copy trading — replicar operaciones en cuentas vinculadas
 

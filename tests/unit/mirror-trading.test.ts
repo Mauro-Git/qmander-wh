@@ -48,12 +48,14 @@ function fakeDeps(overrides: Partial<{
   checkRisk: ReturnType<typeof vi.fn>
   processSignal: ReturnType<typeof vi.fn>
   isDuplicate: ReturnType<typeof vi.fn>
+  isDailyLimitTriggered: ReturnType<typeof vi.fn>
   superadminKillSwitch: boolean
 }> = {}) {
   return {
     checkRisk: overrides.checkRisk ?? vi.fn().mockReturnValue({ allowed: true }),
     processSignal: overrides.processSignal ?? vi.fn().mockResolvedValue(undefined),
     isDuplicate: overrides.isDuplicate ?? vi.fn().mockReturnValue(false),
+    isDailyLimitTriggered: overrides.isDailyLimitTriggered ?? vi.fn().mockResolvedValue(false),
     superadminKillSwitch: overrides.superadminKillSwitch ?? false,
     log: vi.fn(),
   }
@@ -110,7 +112,10 @@ describe('replicateToFollowers', () => {
 
     await replicateToFollowers(baseAlert, 'master-1', deps)
 
-    expect(deps.checkRisk).toHaveBeenCalledWith(baseAlert, f.config, false)
+    expect(deps.isDailyLimitTriggered).toHaveBeenCalledWith('follower-1')
+    expect(deps.checkRisk).toHaveBeenCalledWith(baseAlert, {
+      allowedSymbols: [], maxLots: 2, killSwitch: false, dailyLimitTriggered: false,
+    }, false)
     expect(deps.processSignal).toHaveBeenCalledWith(
       expect.objectContaining({ alert_id: expect.stringContaining('-mirror-follower-1'), lots: 2 }),
       'follower-1',
@@ -140,6 +145,21 @@ describe('replicateToFollowers', () => {
 
     await replicateToFollowers(baseAlert, 'master-1', deps)
 
+    expect(createMock).not.toHaveBeenCalled()
+    expect(deps.processSignal).not.toHaveBeenCalled()
+  })
+
+  it('blocks replication when the follower own daily P&L limit already triggered today', async () => {
+    const f = follower({ id: 'follower-daily' })
+    findManyMock.mockResolvedValue([link(f)])
+    const checkRisk = vi.fn((_alert, config: { dailyLimitTriggered: boolean }) =>
+      config.dailyLimitTriggered ? { allowed: false, reason: 'daily-limit-triggered' as const } : { allowed: true as const }
+    )
+    const deps = fakeDeps({ checkRisk, isDailyLimitTriggered: vi.fn().mockResolvedValue(true) })
+
+    await replicateToFollowers(baseAlert, 'master-1', deps)
+
+    expect(checkRisk).toHaveBeenCalledWith(baseAlert, expect.objectContaining({ dailyLimitTriggered: true }), false)
     expect(createMock).not.toHaveBeenCalled()
     expect(deps.processSignal).not.toHaveBeenCalled()
   })

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { checkRisk, type UserRiskConfig } from '../../src/server.js'
 
-const baseConfig: UserRiskConfig = { allowedSymbols: [], maxLots: 5, killSwitch: false }
+const baseConfig: UserRiskConfig = { allowedSymbols: [], maxLots: 5, killSwitch: false, dailyLimitTriggered: false }
 
 describe('checkRisk', () => {
   it('allows a valid alert within limits', () => {
@@ -18,6 +18,13 @@ describe('checkRisk', () => {
     const config: UserRiskConfig = { ...baseConfig, killSwitch: true }
     const result = checkRisk({ ticker: 'NAS100', lots: 1 }, config, false)
     expect(result).toEqual({ allowed: false, reason: 'user-kill-switch' })
+  })
+
+  it('denies when the daily P&L limit already triggered today, without touching the manual kill switch', () => {
+    const config: UserRiskConfig = { ...baseConfig, dailyLimitTriggered: true }
+    const result = checkRisk({ ticker: 'NAS100', lots: 1 }, config, false)
+    expect(result).toEqual({ allowed: false, reason: 'daily-limit-triggered' })
+    expect(config.killSwitch).toBe(false)
   })
 
   it('denies a symbol not in the allowlist', () => {
