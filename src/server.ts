@@ -185,6 +185,10 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
       const lots = alert.lots ?? 5
 
       if (!state) {
+        if (await isDailyLimitTriggered(userId)) {
+          log('warn', `[scalper] ${account.name}: ABORTADO ${side} en ${ticker} — límite diario disparado durante el procesamiento (${alert.alert_id})`)
+          break
+        }
         await account.marketOrder({
           ticker, side, lots,
           slPips: alert.sl_pips, tpPips: alert.tp_pips,
@@ -200,6 +204,15 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
         const closedScalper = await account.closeByLabel(ticker, 'scalper-')
         const closedSmart = await account.closeByLabel(ticker, 'smarttrail-')
         log('info', `[scalper] ${account.name}: REVERSA cerradas ${closedScalper} scalper + ${closedSmart} smart trail en ${ticker}`)
+
+        // El propio cierre de arriba puede haber realizado el P&L que dispara dailyPnlGuard
+        // (recordRealizedPnl corre sobre cada cierre) — re-chequear antes de abrir la posición
+        // nueva evita dejarla abierta sin la protección del kill switch recién activado.
+        if (await isDailyLimitTriggered(userId)) {
+          scalperState.delete(key)
+          log('warn', `[scalper] ${account.name}: ABORTADO ${side} en ${ticker} — límite diario disparado durante el cierre de la reversa (${alert.alert_id})`)
+          break
+        }
 
         await account.marketOrder({
           ticker, side, lots,
@@ -222,6 +235,10 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
       }
       if (side !== state.direction) {
         log('info', `[smart_trail] ${account.name}: IGNORADO ${side} contra scalper ${state.direction} en ${ticker} (${alert.alert_id})`)
+        break
+      }
+      if (await isDailyLimitTriggered(userId)) {
+        log('warn', `[smart_trail] ${account.name}: ABORTADO ${side} en ${ticker} — límite diario disparado durante el procesamiento (${alert.alert_id})`)
         break
       }
 
