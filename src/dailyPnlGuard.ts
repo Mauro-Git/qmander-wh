@@ -17,6 +17,7 @@
  */
 
 import { prisma } from './lib/prisma.js'
+import { log } from './lib/log.js'
 import type { CTraderAccount } from './ctrader.js'
 
 export interface DailyLimitConfig {
@@ -101,16 +102,17 @@ export async function recordRealizedPnl(
     })
     if (claimed.count === 0) return
 
-    console.warn(
-      `[dailyPnlGuard] ${account.name}: límite diario alcanzado (${result.reason}), ` +
+    log(
+      'warn',
+      `[dailyPnlGuard] ${account.userId}: límite diario alcanzado (${result.reason}), ` +
       `realizedPnl=${state.realizedPnl.toFixed(2)} startBalance=${startBalance.toFixed(2)} — cerrando todo y bloqueando nuevas alertas por hoy`
     )
 
     await account.closeAllPositions().catch((err) => {
-      console.error(`[dailyPnlGuard] ${account.name}: error cerrando posiciones: ${(err as Error).message}`)
+      log('error', `[dailyPnlGuard] ${account.userId}: error cerrando posiciones: ${(err as Error).message}`)
     })
     clearStateHook?.(account.userId)
   } catch (err) {
-    console.error(`[dailyPnlGuard] Error procesando P&L de ${account.name}: ${(err as Error).message}`)
+    log('error', `[dailyPnlGuard] Error procesando P&L de ${account.userId}: ${(err as Error).message}`)
   }
 }
