@@ -63,8 +63,13 @@ export interface AccountConfig {
   symbolMap?: Record<string, string>
   /** Notifica desconexiones inesperadas del WebSocket (no llamadas a close()). */
   onDisconnect?: () => void
-  /** Se dispara con el P&L neto real de cada cierre de posición (ExecutionEvent + closePositionDetail). */
-  onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => void
+  /**
+   * Se dispara con el P&L neto real de cada cierre de posición (ExecutionEvent +
+   * closePositionDetail). Se espera (`await`) antes de considerar el cierre
+   * terminado — ver `waitForFill()` — para que dailyPnlGuard haya evaluado y
+   * persistido el límite diario antes de que quien pidió el cierre siga adelante.
+   */
+  onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => Promise<void> | void
 }
 
 // ── Configuración global (app Spotware, compartida por todos) ──
@@ -122,11 +127,12 @@ export class CTraderAccount {
 
   private symbolMap: Record<string, string>
   private onDisconnect?: () => void
-  private onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => void
+  private onPositionClosed?: (info: { netPnl: number; balanceAfterClose: number }) => Promise<void> | void
   private closedByUs = false
   private ws: WebSocket | null = null
   private msgCounter = 0
   private pending = new Map<string, PendingRequest>()
+  private pendingFills = new Map<number, { resolve: () => void; timer: ReturnType<typeof setTimeout> }>()
   private symbolIdByName = new Map<string, number>()
   private symbolDetailsCache = new Map<number, SymbolDetails>()
   private dayKey = utcDay()
@@ -185,7 +191,31 @@ export class CTraderAccount {
     })
   }
 
-  private handleMessage(raw: string): void {
+  /**
+   * `send(CLOSE_POSITION_REQ)` se resuelve con el ACK de aceptación (ExecutionType
+   * ORDER_ACCEPTED), no con el fill real — el P&L (y por lo tanto dailyPnlGuard) recién
+   * se evalúa cuando llega el ExecutionEvent ORDER_FILLED, en un mensaje WS aparte y
+   * asincrónico. Sin esto, quien pide el cierre podía seguir adelante (ej. abrir la
+   * posición nueva de una reversa) antes de que el límite diario, disparado por el
+   * P&L de ese mismo cierre, quedara persistido — dejando esa posición nueva sin la
+   * protección del kill switch recién activado.
+   */
+  private waitForFill(positionId: number, timeout = 15_000): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer)
+        this.pendingFills.delete(positionId)
+        resolve()
+      }
+      const timer = setTimeout(() => {
+        console.log(this.tag(`Timeout esperando confirmación de cierre (fill) de la posición ${positionId} — se continúa igual`))
+        done()
+      }, timeout)
+      this.pendingFills.set(positionId, { resolve: done, timer })
+    })
+  }
+
+  private async handleMessage(raw: string): Promise<void> {
     let msg: CTraderMessage
     try { msg = JSON.parse(raw) } catch { return }
 
@@ -212,8 +242,12 @@ export class CTraderAccount {
             grossProfit: Number(cpd.grossProfit), swap: Number(cpd.swap), commission: Number(cpd.commission), moneyDigits,
           })
           const balanceAfterClose = scaleMoney(Number(cpd.balance), moneyDigits)
-          this.onPositionClosed?.({ netPnl, balanceAfterClose })
+          // Se espera a que termine (incluye la evaluación + persistencia de dailyPnlGuard)
+          // ANTES de avisarle a waitForFill() que este cierre ya está resuelto.
+          await this.onPositionClosed?.({ netPnl, balanceAfterClose })
         }
+        const positionId = p?.positionId !== undefined ? Number(p.positionId) : undefined
+        if (positionId !== undefined) this.pendingFills.get(positionId)?.resolve()
       }
     }
 
@@ -250,7 +284,7 @@ export class CTraderAccount {
         console.error(this.tag('WebSocket cerrado'))
         if (!this.closedByUs) this.onDisconnect?.()
       })
-      this.ws.on('message', (data) => this.handleMessage(data.toString()))
+      this.ws.on('message', (data) => { void this.handleMessage(data.toString()) })
     })
 
     setInterval(() => {
@@ -363,10 +397,12 @@ export class CTraderAccount {
     for (const p of positions) {
       const td = p.tradeData as Record<string, unknown>
       try {
+        const positionId = Number(p.positionId)
         await this.send(PT.CLOSE_POSITION_REQ, {
           ctidTraderAccountId: this.accountId,
-          positionId: Number(p.positionId), volume: Number(td.volume),
+          positionId, volume: Number(td.volume),
         })
+        await this.waitForFill(positionId)
         closed += 1
       } catch (err) {
         console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
@@ -384,10 +420,12 @@ export class CTraderAccount {
     for (const p of positions) {
       const td = p.tradeData as Record<string, unknown>
       try {
+        const positionId = Number(p.positionId)
         await this.send(PT.CLOSE_POSITION_REQ, {
           ctidTraderAccountId: this.accountId,
-          positionId: Number(p.positionId), volume: Number(td.volume),
+          positionId, volume: Number(td.volume),
         })
+        await this.waitForFill(positionId)
         closed += 1
       } catch (err) {
         console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
@@ -410,10 +448,12 @@ export class CTraderAccount {
     for (const p of toClose) {
       const td = p.tradeData as Record<string, unknown>
       try {
+        const positionId = Number(p.positionId)
         await this.send(PT.CLOSE_POSITION_REQ, {
           ctidTraderAccountId: this.accountId,
-          positionId: Number(p.positionId), volume: Number(td.volume),
+          positionId, volume: Number(td.volume),
         })
+        await this.waitForFill(positionId)
         closed += 1
       } catch (err) {
         console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))

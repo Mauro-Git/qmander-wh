@@ -64,8 +64,8 @@ async function connectAccount(broker: BrokerAccountWithConfig, onAccountReady?: 
         pool.delete(broker.userId)
         prisma.brokerAccount.update({ where: { id: broker.id }, data: { status: 'disconnected' } }).catch(() => {})
       },
-      onPositionClosed: (info) => {
-        recordRealizedPnl(account, info).catch((err) => {
+      onPositionClosed: (info): Promise<void> => {
+        return recordRealizedPnl(account, info).catch((err) => {
           console.error(`[accountPool] Error en recordRealizedPnl para ${broker.userId}: ${(err as Error).message}`)
         })
       },
