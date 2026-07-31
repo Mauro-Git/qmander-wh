@@ -8,21 +8,22 @@ Los usuarios NO son desarrolladores — son traders que necesitan una interfaz s
 
 ## Estado actual
 
-En producción (`main`, rama desplegada): single-tenant, `CTRADER_ACCOUNTS` estático en
-`.env`, un solo `WEBHOOK_SECRET` global.
+En producción (`main`, rama desplegada): **multi-tenant completo**. `feature/multi-tenant`
+se mergeó a `main` el 2026-07-25 (commit `1014108`) y quedó desplegado — el webhook lee
+todo de PostgreSQL (Prisma) en vez de env vars estáticas (ya no existen `CTRADER_ACCOUNTS`
+ni un `WEBHOOK_SECRET` global; ver "Arquitectura — Dos proyectos separados" y
+"Multi-tenant (DB)" más abajo). Incluye enforcement de límites diarios de ganancia/pérdida
+(ver "Límites diarios de ganancia/pérdida" más abajo) y copy trading (ver "Copy trading"
+más abajo), ambos corriendo en producción con varios usuarios reales.
 
-En desarrollo (rama `feature/multi-tenant`, NO desplegada todavía): migración a
-multi-tenant completa. El webhook ahora lee todo de PostgreSQL (Prisma) en vez de env
-vars estáticas — ver "Arquitectura — Dos proyectos separados" y "Multi-tenant (DB)" más
-abajo. Sobre esta misma rama se agregó además el enforcement de límites diarios de
-ganancia/pérdida (ver "Límites diarios de ganancia/pérdida" más abajo). Pendiente:
-verificación end-to-end contra demo antes de mergear a `main`.
+La rama local/remota `feature/multi-tenant` quedó desactualizada tras el merge — no es
+la fuente de verdad, todo el trabajo activo pasa directo por `main`.
 
 - **URL live (main)**: https://wh.qmander.com/ (también https://qmander-tradingview-bridge-tradingview-bridge.pommed.easypanel.host/)
-- **Funcionalidad probada**: Scalper buy/sell, Smart Trail buy/sell, Exit, Close All en NAS100
-- **Motor de señales**: Scalper (papá) + Smart Trail (hijos) + Exit, con reconstrucción de estado al reiniciar
+- **Funcionalidad probada**: Scalper buy/sell, Smart Trail buy/sell, Exit, Close All en NAS100, límites diarios de P&L, copy trading entre cuentas vinculadas
+- **Motor de señales**: Scalper (papá) + Smart Trail (hijos) + Exit, con reconstrucción de estado al reiniciar (y en cada reconexión de cuenta)
 - **Logs**: archivos diarios en `LOG_DIR/YYYY-MM-DD.log` (`/app/logs` en producción), volumen persistente en EasyPanel
-- **Stack actual**: Express.js, WebSocket (`ws`) + JSON (puerto 5036), Zod, Prisma (en `feature/multi-tenant`)
+- **Stack actual**: Express.js, WebSocket (`ws`) + JSON (puerto 5036), Zod, Prisma
 - **Sin dependencias vulnerables**: eliminamos `@reiryoku/ctrader-layer`, `protobufjs`, `axios`
 
 ## Logs y monitoreo
@@ -30,7 +31,7 @@ verificación end-to-end contra demo antes de mergear a `main`.
 Logs se escriben a consola Y a archivos diarios en `/app/logs/` (volumen persistente en EasyPanel).
 Cada alerta aceptada loguea el desfase en segundos con TradingView.
 
-### Endpoints de logs (requieren Authorization: Bearer ADMIN_SECRET en `feature/multi-tenant`; WEBHOOK_SECRET en `main`)
+### Endpoints de logs (requieren Authorization: Bearer ADMIN_SECRET)
 - `GET /admin/logs` — logs de hoy
 - `GET /admin/logs/2026-07-23` — logs de una fecha específica
 - `GET /admin/logs-list` — listar archivos de log disponibles
@@ -127,14 +128,14 @@ base de datos PostgreSQL:
 
 ## Fases del proyecto
 
-### Fase 1A — Base de datos + Webhook lee de PostgreSQL — EN CURSO (`feature/multi-tenant`)
+### Fase 1A — Base de datos + Webhook lee de PostgreSQL — COMPLETADA, en `main`
 1. ✅ PostgreSQL en EasyPanel (`qmander-db`), compartida con trading-dashboard
 2. ✅ Prisma en el webhook, mismo `schema.prisma` que trading-dashboard (solo `prisma generate`, nunca `migrate`/`db push` desde este repo)
 3. ✅ El webhook autentica por `User.webhookToken` y lee `UserConfig`/`BrokerAccount` de PostgreSQL en vez del `.env`
-4. ✅ Cada alerta aceptada se registra en `Trade` (`queued` → `executed`/`failed`/`retrying`)
+4. ✅ Cada alerta aceptada se registra en `Trade` (`queued` → `executed`/`failed`/`retrying`), incluyendo `brokerOrderId`/`brokerPositionId` cuando la alerta abre una posición nueva
 5. ✅ Credenciales del broker desencriptadas con AES-256-GCM (`src/lib/crypto.ts`, mismo `ENCRYPTION_KEY` que el dashboard)
-6. ⏳ Verificación end-to-end contra cTrader demo antes de mergear a `main`
-7. ⏳ Deploy a EasyPanel (requiere agregar `DATABASE_URL`/`ENCRYPTION_KEY`/`ADMIN_SECRET` a las env vars del servicio)
+6. ✅ Verificación end-to-end contra cTrader demo — mergeado a `main` el 2026-07-25
+7. ✅ Deploy a EasyPanel — corriendo en producción con `DATABASE_URL`/`ENCRYPTION_KEY`/`ADMIN_SECRET` configurados
 8. ✅ Copy trading: replicar operaciones en cuentas vinculadas (`AccountLink`, ver "Copy trading" más abajo)
 
 ### Fase 1B — Frontend básico (Proyecto 2)
@@ -163,7 +164,10 @@ base de datos PostgreSQL:
 4. **Idempotencia** — deduplicación por `${userId}:${alert_id}` (no global)
 5. **Riesgo** — kill switch superadmin (global, en memoria, `POST /admin/kill-switch`
    con `ADMIN_SECRET`) → `UserConfig.killSwitch` del usuario → `allowedSymbols` →
-   `maxLots`, todo por usuario desde `UserConfig`
+   `maxLots`, todo por usuario desde `UserConfig`. **Excepción**: `exit`/`close_all`
+   siempre pasan este chequeo (salvo el kill switch superadmin) — un cierre nunca debe
+   quedar atrapado por el propio riesgo del usuario (ver detalle en "Capa 5 de riesgo" bajo
+   "Límites diarios de ganancia/pérdida")
 
 ## Lógica de señales — Scalper + Smart Trail + Exit
 
@@ -222,7 +226,7 @@ Campos:
 - Conexión: WebSocket + JSON al puerto 5036 (NO Protobuf puerto 5035)
 - Demo: wss://demo.ctraderapi.com:5036
 - Live: wss://live.ctraderapi.com:5036
-- **Multi-tenant (`feature/multi-tenant`)**: `src/ctrader.ts` (clase `CTraderAccount`) es
+- **Multi-tenant**: `src/ctrader.ts` (clase `CTraderAccount`) es
   agnóstico de la DB — recibe `{userId, name, host, accessToken, accountId, symbolMap}`
   por constructor. `src/accountPool.ts` es el puente con Prisma: lee `BrokerAccount` de la
   DB, desencripta tokens, refresca si están por vencer, y mantiene un
@@ -240,7 +244,7 @@ Campos:
 
 ## Multi-tenant — configuración por usuario (DB, no .env)
 
-En `feature/multi-tenant`, `CTRADER_HOST`/`accessToken`/`accountId`/`ALLOWED_SYMBOLS`/
+`CTRADER_HOST`/`accessToken`/`accountId`/`ALLOWED_SYMBOLS`/
 `MAX_LOTS`/`killSwitch`/`SYMBOL_MAP` ya NO son env vars — viven en `BrokerAccount` y
 `UserConfig` (una fila por usuario), gestionadas desde el dashboard. Env vars que
 siguen siendo globales (compartidas por todos los usuarios):
@@ -319,11 +323,21 @@ registrado una vez desde `server.ts` — evita import circular
 server.ts↔accountPool.ts↔ctrader.ts) para que el motor de señales no crea que sigue
 habiendo una posición abierta que en realidad se cerró por este mecanismo.
 
-**Capa 5 de riesgo (`checkRisk` en `server.ts`) rechaza una alerta si CUALQUIERA de dos
-condiciones independientes es verdadera**: `UserConfig.killSwitch === true` (manual) o
-`DailyPnlState` de hoy para ese usuario tiene `triggered === true` (automático, vía
-`isDailyLimitTriggered()` en `dailyPnlGuard.ts`). Copy trading (`mirrorTrading.ts`)
-evalúa esta misma condición con el `userId` del **vinculado**, nunca el del maestro.
+**Capa 5 de riesgo (`checkRisk` en `server.ts`) rechaza una alerta `scalper`/`smart_trail`
+si CUALQUIERA de dos condiciones independientes es verdadera**: `UserConfig.killSwitch
+=== true` (manual) o `DailyPnlState` de hoy para ese usuario tiene `triggered === true`
+(automático, vía `isDailyLimitTriggered()` en `dailyPnlGuard.ts`). Copy trading
+(`mirrorTrading.ts`) evalúa esta misma condición con el `userId` del **vinculado**, nunca
+el del maestro.
+
+**Excepción — `exit`/`close_all` siempre se permiten** (desde el 2026-07-31): bloquear un
+cierre por el riesgo propio del usuario dejaba una posición abierta atrapada justo cuando
+más se quería reducir exposición. `checkRisk` ahora deja pasar cualquier `exit`/`close_all`
+sin mirar `killSwitch`, `DailyPnlState.triggered`, `allowedSymbols` ni `maxLots` — el único
+freno que les sigue aplicando es el kill switch de emergencia superadmin (evaluado antes,
+bloquea todo sin excepción). Esto aplica igual al maestro y a cada vinculado en copy
+trading: un `killSwitch` o límite diario del vinculado ya NO bloquea los cierres
+replicados.
 
 ## Copy trading — replicar operaciones en cuentas vinculadas
 
@@ -339,9 +353,11 @@ del maestro en `/webhook/tradingview`): se ejecuta la alerta normalmente para el
 `AccountLink` aceptados. Por cada vinculado:
 
 - Se evalúa el riesgo con la config del **vinculado**, nunca la del maestro — `checkRisk`
-  (la misma función pura que usa el maestro) con `UserConfig` del vinculado. Esto incluye
-  su propio `killSwitch`: igual que hoy `checkRisk` no distingue por tipo de acción, un
-  `killSwitch` del vinculado bloquea también los cierres replicados, por consistencia.
+  (la misma función pura que usa el maestro) con `UserConfig` del vinculado. Para
+  `scalper`/`smart_trail` esto incluye su propio `killSwitch`/límite diario/`allowedSymbols`/
+  `maxLots`; para `exit`/`close_all` esos cuatro chequeos no aplican (ver excepción en
+  "Capa 5 de riesgo" más abajo) — el cierre replicado solo lo frena el kill switch
+  superadmin.
 - Lotes = `Math.min(alert.lots, followerConfig.maxLots)` (`buildMirrorAlert`) — nunca los
   lotes del maestro tal cual. Símbolo resuelto con el `symbolMap` propio del vinculado
   (mismo mecanismo que ya usa `processSignal` para cualquier usuario).
@@ -397,3 +413,6 @@ se inyectan por parámetro en `replicateToFollowers()` en vez de importarse dire
 - El error `MARKET_CLOSED` de cTrader es una respuesta de negocio legítima (mercado cerrado fuera de horario), no un bug — se propaga igual que cualquier otro error de la API a través del pipeline de reintentos y auditoría en `Trade`
 - La doc renderizada de help.ctrader.com/open-api/messages/ está incompleta (no lista todos los campos de `ProtoOADeal`/`ProtoOAClosePositionDetail`/`ProtoOAExecutionEvent`). El `.proto` fuente en `github.com/spotware/openapi-proto-messages` (`OpenApiMessages.proto`, `OpenApiModelMessages.proto`) es la fuente de verdad real — consultarlo directo cuando se necesite el nombre exacto de un campo, no asumir ni confiar solo en la doc renderizada
 - `ProtoOAExecutionEvent` trae `order`, `position` Y `deal` (este último no se leía hasta agregar el enforcement de límites diarios) — `deal.closePositionDetail` solo está presente cuando el fill efectivamente cierra una posición, no en fills que abren
+- `rebuildStateForAccount()` corre en cada conexión nueva de una cuenta, no solo al arrancar el proceso (también en la reconexión perezosa de `accountPool.ts`). Al principio solo rellenaba huecos en `scalperState` (`if (scalperState.has(key)) continue`) — si el usuario cerraba una posición manualmente o reconectaba con el estado real cambiado, la entrada vieja en memoria nunca se corregía, y una señal `scalper` real quedaba IGNORADA en silencio (el `Trade` igual se marcaba `executed` porque `processSignal` no lanza error en ese camino). Se arregló limpiando primero todas las entradas del usuario antes de reconstruir desde las posiciones reales de cTrader
+- `checkRisk` permite siempre `exit`/`close_all` desde el 2026-07-31 (commit `4ca3754`) — el `killSwitch`/límite diario/`allowedSymbols`/`maxLots` del usuario ya NO bloquean un cierre, solo el kill switch superadmin. Motivo: bloquear un cierre por el propio riesgo del usuario dejaba posiciones atrapadas justo cuando más se quería reducir exposición. Ojo al leer código o tests viejos que asuman que `checkRisk` es uniforme para toda acción — ya no lo es
+- Un maestro con copy trading puede cerrar posiciones en su propia cuenta por fuera de una señal de TradingView — típicamente `dailyPnlGuard` disparando por límite diario, que llama `closeAllPositions()` directo sobre esa cuenta sin pasar por `processSignal`/`mirrorTrading.ts`. Ese cierre NO se replica a los vinculados (no genera `Trade` ni pasa por el pipeline de señales) — un vinculado puede quedar con una posición abierta que el maestro ya cerró, sin que nada en el sistema lo detecte o corrija automáticamente
