@@ -61,4 +61,32 @@ describe('checkRisk', () => {
     expect(checkRisk({ ticker: 'NAS100' }, userA, false).allowed).toBe(false)
     expect(checkRisk({ ticker: 'NAS100' }, userB, false).allowed).toBe(true)
   })
+
+  it('always allows exit/close_all even with the user kill switch active — closing must never get trapped', () => {
+    const config: UserRiskConfig = { ...baseConfig, killSwitch: true }
+    expect(checkRisk({ ticker: 'NAS100', signal: 'exit' }, config, false).allowed).toBe(true)
+    expect(checkRisk({ ticker: 'NAS100', signal: 'close_all' }, config, false).allowed).toBe(true)
+  })
+
+  it('always allows exit/close_all even with the daily limit already triggered', () => {
+    const config: UserRiskConfig = { ...baseConfig, dailyLimitTriggered: true }
+    expect(checkRisk({ ticker: 'NAS100', signal: 'exit' }, config, false).allowed).toBe(true)
+  })
+
+  it('always allows exit/close_all even for a symbol outside the allowlist or lots over maxLots', () => {
+    const config: UserRiskConfig = { ...baseConfig, allowedSymbols: ['EURUSD'], maxLots: 1 }
+    const result = checkRisk({ ticker: 'NAS100', lots: 99, signal: 'close_all' }, config, false)
+    expect(result.allowed).toBe(true)
+  })
+
+  it('the superadmin emergency kill switch still blocks exit/close_all — it freezes everything', () => {
+    const result = checkRisk({ ticker: 'NAS100', signal: 'close_all' }, baseConfig, true)
+    expect(result).toEqual({ allowed: false, reason: 'superadmin-kill-switch' })
+  })
+
+  it('scalper/smart_trail signals still go through the normal risk checks (only exit/close_all are exempt)', () => {
+    const config: UserRiskConfig = { ...baseConfig, killSwitch: true }
+    expect(checkRisk({ ticker: 'NAS100', signal: 'scalper' }, config, false).allowed).toBe(false)
+    expect(checkRisk({ ticker: 'NAS100', signal: 'smart_trail' }, config, false).allowed).toBe(false)
+  })
 })

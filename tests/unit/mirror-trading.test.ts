@@ -66,6 +66,7 @@ beforeEach(() => {
   createMock.mockReset()
   updateMock.mockReset()
   createMock.mockResolvedValue({ id: 'trade-mirror-1' })
+  updateMock.mockResolvedValue({})
 })
 
 describe('buildMirrorAlert', () => {
@@ -175,32 +176,78 @@ describe('replicateToFollowers', () => {
     expect(deps.processSignal).not.toHaveBeenCalled()
   })
 
-  it('records a failed Trade under the follower userId when replication errors out, without throwing', async () => {
-    const f = follower({ id: 'follower-5' })
-    findManyMock.mockResolvedValue([link(f)])
-    const deps = fakeDeps({ processSignal: vi.fn().mockRejectedValue(new Error('cuenta desconectada')) })
+  it('retries a transient failure up to 3 times before giving up, marking failed only after the last attempt', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = follower({ id: 'follower-5' })
+      findManyMock.mockResolvedValue([link(f)])
+      const processSignal = vi.fn().mockRejectedValue(new Error('cuenta desconectada'))
+      const deps = fakeDeps({ processSignal })
 
-    await expect(replicateToFollowers(baseAlert, 'master-1', deps)).resolves.toBeUndefined()
+      const promise = replicateToFollowers(baseAlert, 'master-1', deps)
+      await vi.advanceTimersByTimeAsync(100000)
+      await expect(promise).resolves.toBeUndefined()
 
-    expect(updateMock).toHaveBeenCalledWith({
-      where: { id: 'trade-mirror-1' },
-      data: { status: 'failed', error: 'cuenta desconectada' },
-    })
+      expect(processSignal).toHaveBeenCalledTimes(3)
+      expect(updateMock).toHaveBeenCalledWith({
+        where: { id: 'trade-mirror-1' },
+        data: { status: 'retrying', error: 'cuenta desconectada' },
+      })
+      expect(updateMock).toHaveBeenCalledWith({
+        where: { id: 'trade-mirror-1' },
+        data: { status: 'failed', error: 'cuenta desconectada' },
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('marks executed if a retry succeeds after a transient failure, without exhausting all attempts', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = follower({ id: 'follower-retry' })
+      findManyMock.mockResolvedValue([link(f)])
+      const processSignal = vi.fn()
+        .mockRejectedValueOnce(new Error('timeout esperando respuesta'))
+        .mockResolvedValueOnce(undefined)
+      const deps = fakeDeps({ processSignal })
+
+      const promise = replicateToFollowers(baseAlert, 'master-1', deps)
+      await vi.advanceTimersByTimeAsync(100000)
+      await promise
+
+      expect(processSignal).toHaveBeenCalledTimes(2)
+      expect(updateMock).toHaveBeenCalledWith({
+        where: { id: 'trade-mirror-1' },
+        data: { status: 'retrying', error: 'timeout esperando respuesta' },
+      })
+      expect(updateMock).toHaveBeenCalledWith({ where: { id: 'trade-mirror-1' }, data: { status: 'executed' } })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('does not let one failing follower affect the others (Promise.allSettled)', async () => {
-    const ok = follower({ id: 'follower-ok' })
-    const bad = follower({ id: 'follower-bad' })
-    findManyMock.mockResolvedValue([link(bad), link(ok)])
-    const processSignal = vi.fn()
-      .mockRejectedValueOnce(new Error('falla vinculado malo'))
-      .mockResolvedValueOnce(undefined)
-    const deps = fakeDeps({ processSignal })
+    vi.useFakeTimers()
+    try {
+      const ok = follower({ id: 'follower-ok' })
+      const bad = follower({ id: 'follower-bad' })
+      findManyMock.mockResolvedValue([link(bad), link(ok)])
+      const processSignal = vi.fn(async (_alert: unknown, userId: string) => {
+        if (userId === 'follower-bad') throw new Error('falla vinculado malo')
+      })
+      const deps = fakeDeps({ processSignal })
 
-    await replicateToFollowers(baseAlert, 'master-1', deps)
+      const promise = replicateToFollowers(baseAlert, 'master-1', deps)
+      await vi.advanceTimersByTimeAsync(100000)
+      await promise
 
-    expect(processSignal).toHaveBeenCalledTimes(2)
-    expect(updateMock).toHaveBeenCalledWith({ where: { id: 'trade-mirror-1' }, data: { status: 'executed' } })
-    expect(updateMock).toHaveBeenCalledWith({ where: { id: 'trade-mirror-1' }, data: { status: 'failed', error: 'falla vinculado malo' } })
+      // follower-bad agota los 3 intentos, follower-ok se resuelve al primero.
+      expect(processSignal).toHaveBeenCalledTimes(4)
+      expect(updateMock).toHaveBeenCalledWith({ where: { id: 'trade-mirror-1' }, data: { status: 'executed' } })
+      expect(updateMock).toHaveBeenCalledWith({ where: { id: 'trade-mirror-1' }, data: { status: 'failed', error: 'falla vinculado malo' } })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

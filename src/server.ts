@@ -113,11 +113,19 @@ export type RiskDenyReason =
   | 'max-lots-exceeded'
 
 export function checkRisk(
-  alert: { ticker: string; lots?: number },
+  alert: { ticker: string; lots?: number; signal?: Alert['signal'] },
   config: UserRiskConfig,
   superadminKillSwitch: boolean
 ): { allowed: true } | { allowed: false; reason: RiskDenyReason } {
   if (superadminKillSwitch) return { allowed: false, reason: 'superadmin-kill-switch' }
+
+  // Cerrar (exit/close_all) siempre debe poder ejecutarse: bloquearlo por el
+  // riesgo propio del usuario (kill switch, límite diario, símbolo, lotes) deja
+  // una posición abierta atrapada justo cuando el usuario más quiere reducir
+  // exposición. El único freno que sigue aplicando a un cierre es el kill
+  // switch de emergencia superadmin, ya evaluado arriba.
+  if (alert.signal === 'exit' || alert.signal === 'close_all') return { allowed: true }
+
   if (config.killSwitch) return { allowed: false, reason: 'user-kill-switch' }
   if (config.dailyLimitTriggered) return { allowed: false, reason: 'daily-limit-triggered' }
   if (config.allowedSymbols.length > 0 && !config.allowedSymbols.includes(alert.ticker.toUpperCase())) {
@@ -153,13 +161,27 @@ function isDuplicate(id: string): boolean {
 
 // ── Reconstrucción de estado al conectar una cuenta ───────────
 
+// Se ejecuta en cada conexión nueva de la cuenta (arranque o reconexión
+// perezosa vía getAccountForUser) — no solo al iniciar el proceso. Por eso
+// limpia primero todo lo que había en memoria para este usuario en vez de
+// solo rellenar huecos: si el usuario desconectó/reconectó la cuenta (o
+// cerró una posición manualmente) mientras el proceso seguía corriendo,
+// scalperState puede haber quedado con una dirección que ya no existe en
+// el broker. Con el rellenado de huecos de antes, esa entrada vieja nunca
+// se corregía y una señal "scalper" en la misma dirección quedaba
+// IGNORADA (sin mandar la orden) pero el Trade igual se marcaba
+// "executed" porque processSignal no lanza error en ese camino.
 async function rebuildStateForAccount(account: CTraderAccount): Promise<void> {
+  const prefix = `${account.userId}:`
+  for (const key of scalperState.keys()) {
+    if (key.startsWith(prefix)) scalperState.delete(key)
+  }
+
   const positions = await account.getOpenPositions()
   for (const pos of positions) {
     if (!pos.label.startsWith('scalper-')) continue
     const direction = pos.tradeSide === 1 ? 'buy' : 'sell' as const
     const key = stateKey(account.userId, pos.symbolName)
-    if (scalperState.has(key)) continue
     const smartTrails = positions.filter(
       p => p.symbolId === pos.symbolId && p.label.startsWith('smarttrail-')
     ).length

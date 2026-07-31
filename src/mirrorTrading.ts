@@ -15,8 +15,11 @@
 import { prisma } from './lib/prisma.js'
 import type { Alert, UserRiskConfig, RiskDenyReason } from './server.js'
 
+const MAX_MIRROR_ATTEMPTS = 3
+const MIRROR_RETRY_BACKOFF_MS = 1500
+
 export type MirrorRiskCheck = (
-  alert: { ticker: string; lots?: number },
+  alert: { ticker: string; lots?: number; signal?: Alert['signal'] },
   config: UserRiskConfig,
   superadminKillSwitch: boolean
 ) => { allowed: true } | { allowed: false; reason: RiskDenyReason }
@@ -97,13 +100,25 @@ async function replicateToFollower(
     },
   })
 
-  try {
-    await deps.processSignal(mirrorAlert, follower.id, follower.config.symbolMap as Record<string, string>)
-    await prisma.trade.update({ where: { id: trade.id }, data: { status: 'executed' } })
-  } catch (err) {
-    const message = (err as Error).message
-    deps.log('error', `[mirror] Fallo replicando en vinculado ${follower.id}: ${message}`)
-    await prisma.trade.update({ where: { id: trade.id }, data: { status: 'failed', error: message } })
-      .catch(() => {})
+  // Mismos reintentos que la cola del master (processQueue en server.ts): sin
+  // esto, un hipo transitorio en la cuenta del vinculado (por ejemplo,
+  // reconectando justo en ese momento) dejaba esa pata sin abrir/cerrar para
+  // siempre mientras el master sí la tenía, rompiendo el espejo entre cuentas.
+  for (let attempt = 1; attempt <= MAX_MIRROR_ATTEMPTS; attempt++) {
+    try {
+      await deps.processSignal(mirrorAlert, follower.id, follower.config.symbolMap as Record<string, string>)
+      await prisma.trade.update({ where: { id: trade.id }, data: { status: 'executed' } })
+      return
+    } catch (err) {
+      const message = (err as Error).message
+      if (attempt < MAX_MIRROR_ATTEMPTS) {
+        deps.log('warn', `[mirror] Reintento ${attempt} en vinculado ${follower.id}: ${message}`)
+        await prisma.trade.update({ where: { id: trade.id }, data: { status: 'retrying', error: message } }).catch(() => {})
+        await new Promise((resolve) => setTimeout(resolve, MIRROR_RETRY_BACKOFF_MS * attempt))
+      } else {
+        deps.log('error', `[mirror] Fallo replicando en vinculado ${follower.id} tras ${MAX_MIRROR_ATTEMPTS} intentos: ${message}`)
+        await prisma.trade.update({ where: { id: trade.id }, data: { status: 'failed', error: message } }).catch(() => {})
+      }
+    }
   }
 }
