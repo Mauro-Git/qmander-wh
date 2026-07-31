@@ -13,7 +13,7 @@
  */
 
 import { prisma } from './lib/prisma.js'
-import type { Alert, UserRiskConfig, RiskDenyReason } from './server.js'
+import type { Alert, UserRiskConfig, RiskDenyReason, OpenedOrderRef } from './server.js'
 
 const MAX_MIRROR_ATTEMPTS = 3
 const MIRROR_RETRY_BACKOFF_MS = 1500
@@ -26,7 +26,7 @@ export type MirrorRiskCheck = (
 
 export interface MirrorDeps {
   checkRisk: MirrorRiskCheck
-  processSignal: (alert: Alert, userId: string, symbolMap: Record<string, string>) => Promise<void>
+  processSignal: (alert: Alert, userId: string, symbolMap: Record<string, string>) => Promise<OpenedOrderRef | undefined>
   isDuplicate: (id: string) => boolean
   isDailyLimitTriggered: (userId: string) => Promise<boolean>
   superadminKillSwitch: boolean
@@ -106,8 +106,11 @@ async function replicateToFollower(
   // siempre mientras el master sí la tenía, rompiendo el espejo entre cuentas.
   for (let attempt = 1; attempt <= MAX_MIRROR_ATTEMPTS; attempt++) {
     try {
-      await deps.processSignal(mirrorAlert, follower.id, follower.config.symbolMap as Record<string, string>)
-      await prisma.trade.update({ where: { id: trade.id }, data: { status: 'executed' } })
+      const openedOrder = await deps.processSignal(mirrorAlert, follower.id, follower.config.symbolMap as Record<string, string>)
+      await prisma.trade.update({
+        where: { id: trade.id },
+        data: { status: 'executed', brokerOrderId: openedOrder?.orderId, brokerPositionId: openedOrder?.positionId },
+      })
       return
     } catch (err) {
       const message = (err as Error).message

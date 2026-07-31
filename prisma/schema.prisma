@@ -138,6 +138,13 @@ model Trade {
   status  String // queued | executed | failed | retrying
   error   String?
 
+  // ID que asigna cTrader al abrir una posición nueva por esta alerta (scalper,
+  // smart_trail, o la apertura de una reversa). Null en exit/close_all/señales
+  // ignoradas, y en reversas no cubre los cierres previos — esos solo quedan en
+  // el log [cierre] de ctrader.ts, no en esta fila.
+  brokerOrderId    String?
+  brokerPositionId String?
+
   sourceIp  String
   createdAt DateTime @default(now())
 

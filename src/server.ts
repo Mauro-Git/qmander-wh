@@ -192,7 +192,14 @@ async function rebuildStateForAccount(account: CTraderAccount): Promise<void> {
 
 // ── Motor de reglas Scalper / Smart Trail / Exit ─────────────
 
-export async function processSignal(alert: Alert, userId: string, symbolMap: Record<string, string>): Promise<void> {
+export type OpenedOrderRef = { orderId?: string; positionId?: string }
+
+// Devuelve el orderId/positionId que asignó el broker si esta alerta abrió una
+// posición nueva (scalper, smart_trail, o la apertura de una reversa) — undefined
+// en exit/close_all/señales ignoradas, y en reversas no cubre los cierres previos
+// (esos solo quedan en el log [cierre] de ctrader.ts). Server.ts/mirrorTrading.ts lo
+// persisten en Trade.brokerOrderId/brokerPositionId.
+export async function processSignal(alert: Alert, userId: string, symbolMap: Record<string, string>): Promise<OpenedOrderRef | undefined> {
   const account = await getAccountForUser(userId, rebuildStateForAccount)
   if (!account) throw new Error('No se pudo conectar la cuenta cTrader del usuario')
   account.setSymbolMap(symbolMap)
@@ -200,6 +207,7 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
   const ticker = alert.ticker
   const key = stateKey(userId, ticker)
   const state = scalperState.get(key)
+  let openedOrder: OpenedOrderRef | undefined
 
   switch (alert.signal) {
     case 'scalper': {
@@ -211,7 +219,7 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
           log('warn', `[scalper] ${account.name}: ABORTADO ${side} en ${ticker} — límite diario disparado durante el procesamiento (${alert.alert_id})`)
           break
         }
-        await account.marketOrder({
+        openedOrder = await account.marketOrder({
           ticker, side, lots,
           slPips: alert.sl_pips, tpPips: alert.tp_pips,
           label: `scalper-${side}`,
@@ -236,7 +244,7 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
           break
         }
 
-        await account.marketOrder({
+        openedOrder = await account.marketOrder({
           ticker, side, lots,
           slPips: alert.sl_pips, tpPips: alert.tp_pips,
           label: `scalper-${side}`,
@@ -267,7 +275,7 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
       state.smartTrailCount += 1
       const label = `smarttrail-${side}-${state.smartTrailCount}`
 
-      await account.marketOrder({
+      openedOrder = await account.marketOrder({
         ticker, side, lots,
         slPips: alert.sl_pips, tpPips: alert.tp_pips,
         label,
@@ -294,6 +302,8 @@ export async function processSignal(alert: Alert, userId: string, symbolMap: Rec
       break
     }
   }
+
+  return openedOrder
 }
 
 // ── Cola asíncrona con reintentos ────────────────────────────
@@ -308,9 +318,11 @@ async function processQueue(): Promise<void> {
   while (queue.length > 0) {
     const job = queue.shift() as Job
     try {
-      await processSignal(job.alert, job.userId, job.symbolMap)
-      await prisma.trade.update({ where: { id: job.tradeId }, data: { status: 'executed' } })
-        .catch((err) => log('error', `No se pudo actualizar Trade ${job.tradeId}: ${(err as Error).message}`))
+      const openedOrder = await processSignal(job.alert, job.userId, job.symbolMap)
+      await prisma.trade.update({
+        where: { id: job.tradeId },
+        data: { status: 'executed', brokerOrderId: openedOrder?.orderId, brokerPositionId: openedOrder?.positionId },
+      }).catch((err) => log('error', `No se pudo actualizar Trade ${job.tradeId}: ${(err as Error).message}`))
     } catch (err) {
       const message = (err as Error).message
       job.attempts += 1

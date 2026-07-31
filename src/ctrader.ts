@@ -363,7 +363,7 @@ export class CTraderAccount {
   async marketOrder(params: {
     ticker: string; side: 'buy' | 'sell'; lots: number;
     slPips?: number; tpPips?: number; label?: string
-  }): Promise<void> {
+  }): Promise<{ orderId?: string; positionId?: string }> {
     if (!this.connected) throw new Error(this.tag('Sin conexión'))
 
     const symbolId = this.resolveSymbolId(params.ticker)
@@ -382,7 +382,15 @@ export class CTraderAccount {
     if (relativeStopLoss) payload.relativeStopLoss = relativeStopLoss
     if (relativeTakeProfit) payload.relativeTakeProfit = relativeTakeProfit
 
-    await this.send(PT.NEW_ORDER_REQ, payload)
+    const res = await this.send(PT.NEW_ORDER_REQ, payload)
+    const o = res.payload.order as Record<string, unknown> | undefined
+    const p = res.payload.position as Record<string, unknown> | undefined
+    const orderId = o?.orderId !== undefined ? String(o.orderId) : undefined
+    const positionId = p?.positionId !== undefined ? String(p.positionId) : undefined
+    console.log(this.tag(
+      `[orden] ${payload.label} ${params.ticker} ${params.side} → orderId=${orderId ?? '-'} positionId=${positionId ?? '-'}`
+    ))
+    return { orderId, positionId }
   }
 
   async closeAll(ticker: string): Promise<number> {
@@ -403,6 +411,7 @@ export class CTraderAccount {
           positionId, volume: Number(td.volume),
         })
         await this.waitForFill(positionId)
+        console.log(this.tag(`[cierre] ${td.label ?? '-'} positionId=${positionId} cerrada`))
         closed += 1
       } catch (err) {
         console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
@@ -426,6 +435,7 @@ export class CTraderAccount {
           positionId, volume: Number(td.volume),
         })
         await this.waitForFill(positionId)
+        console.log(this.tag(`[cierre] ${td.label ?? '-'} positionId=${positionId} cerrada`))
         closed += 1
       } catch (err) {
         console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
@@ -454,6 +464,7 @@ export class CTraderAccount {
           positionId, volume: Number(td.volume),
         })
         await this.waitForFill(positionId)
+        console.log(this.tag(`[cierre] ${td.label ?? '-'} positionId=${positionId} cerrada`))
         closed += 1
       } catch (err) {
         console.log(this.tag(`Posición ${p.positionId} no se pudo cerrar: ${(err as Error).message}`))
